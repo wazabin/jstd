@@ -1,0 +1,14 @@
+// Outer if-else where the "then" branch contains a second if-else.
+digraph nested {
+  entry -> branch
+  branch -> then_start
+  branch -> else_start
+  then_start -> inner_left
+  then_start -> inner_right
+  inner_left -> then_end
+  inner_right -> then_end
+  else_start -> else_end
+  then_end -> merge
+  else_end -> merge
+  merge -> exit
+}

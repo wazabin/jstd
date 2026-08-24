@@ -1,0 +1,39 @@
+[workspace]
+members = ["derive"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+criterion = "0.5"
+
+[package]
+name = "jstd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Typed identifiers, graphs, registries, and string interning"
+readme = "README.md"
+
+[dependencies]
+# Fast non-cryptographic hasher for internal int-keyed maps; deterministic
+# iteration order (std RandomState reseeds per process).
+rustc-hash.workspace = true
+jstd_derive = { version = "0.1.0", path = "derive" }
+serde.workspace = true
+
+[dev-dependencies]
+bincode.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "stable_arena"
+harness = false

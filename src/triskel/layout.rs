@@ -1,0 +1,1272 @@
+//! Public layout API and per-component orchestration.
+//!
+//! [`LayoutBuilder`] is the entry point. It runs the layered-layout pipeline on
+//! each weakly-connected component of the input graph independently, then packs
+//! the components left-to-right. Internally the work is done on a `usize`-id
+//! [`LayoutGraph`] (so dummy vertices can be minted freely); results are mapped
+//! back to the caller's strongly-typed node/edge ids.
+
+use std::{
+    error::Error,
+    fmt::{self, Debug},
+};
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
+use crate::{
+    graph::{Graph, GraphMut, edge::Edge, node::Node, owning::OwningGraph},
+    registry::Identifier,
+    triskel::{
+        coordinate, cycle, order, rank,
+        render::{render_html, render_html_with_labels, render_svg, render_svg_with_labels},
+        router::{EdgeRouter, EdgeStyle, OrthogonalRouter, StraightRouter},
+        segment,
+    },
+};
+
+const DEFAULT_NODE_SIZE: f64 = 24.0;
+const DEFAULT_LAYER_GAP: f64 = 50.0;
+const DEFAULT_NODE_GAP: f64 = 40.0;
+const DEFAULT_MAX_SWEEPS: usize = 8;
+
+/// Protrusion of the innermost self-loop beyond the node's right edge.
+const SELF_LOOP_GAP: f64 = 16.0;
+/// Extra protrusion for each further self-loop stacked on the same node.
+const SELF_LOOP_STEP: f64 = 8.0;
+
+/// Horizontal room a node must reserve on its right to draw `count` self-loops.
+pub(crate) fn loop_reserve(count: u32) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        SELF_LOOP_GAP + (count - 1) as f64 * SELF_LOOP_STEP
+    }
+}
+
+/// The orthogonal waypoints for the `index`-th of `total` self-loops on a node
+/// at `(x, y)` with size `width`×`height`. Loops nest: outer ones span more of
+/// the right face and protrude further, so stacked loops never draw over each
+/// other. The polyline leaves and re-enters the node's right face.
+fn self_loop_waypoints(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    index: u32,
+    total: u32,
+) -> Vec<Point> {
+    let right = x + width / 2.0;
+    let span = height / 2.0 * (index + 1) as f64 / (total + 1) as f64;
+    let out = right + SELF_LOOP_GAP + index as f64 * SELF_LOOP_STEP;
+    vec![
+        Point {
+            x: right,
+            y: y - span,
+        },
+        Point {
+            x: out,
+            y: y - span,
+        },
+        Point {
+            x: out,
+            y: y + span,
+        },
+        Point {
+            x: right,
+            y: y + span,
+        },
+    ]
+}
+
+// ── Public value types ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeGeometry {
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Default for NodeGeometry {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_NODE_SIZE,
+            height: DEFAULT_NODE_SIZE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutSettings {
+    /// Vertical gap between the facing edges of adjacent ranks.
+    pub layer_gap: f64,
+    /// Minimum horizontal gap between the facing edges of adjacent nodes.
+    pub node_gap: f64,
+    /// Edge drawing style.
+    pub edge_style: EdgeStyle,
+    /// Maximum up/down ordering sweeps during crossing reduction.
+    pub max_sweeps: usize,
+}
+
+impl Default for LayoutSettings {
+    fn default() -> Self {
+        Self {
+            layer_gap: DEFAULT_LAYER_GAP,
+            node_gap: DEFAULT_NODE_GAP,
+            edge_style: EdgeStyle::default(),
+            max_sweeps: DEFAULT_MAX_SWEEPS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutError {
+    EmptyGraph,
+}
+
+impl fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LayoutError::EmptyGraph => f.write_str("cannot lay out an empty graph"),
+        }
+    }
+}
+
+impl Error for LayoutError {}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutNode<NodeId: Identifier> {
+    pub id: NodeId,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LayoutResult<NodeId: Identifier, EdgeId: Identifier> {
+    pub nodes: HashMap<NodeId, LayoutNode<NodeId>>,
+    pub edges: HashMap<EdgeId, Vec<Point>>,
+}
+
+impl<NodeId: Identifier, EdgeId: Identifier> LayoutResult<NodeId, EdgeId> {
+    pub fn get_node(&self, node: NodeId) -> Option<&LayoutNode<NodeId>> {
+        self.nodes.get(&node)
+    }
+
+    pub fn get_waypoints(&self, edge: EdgeId) -> Option<&[Point]> {
+        self.edges.get(&edge).map(Vec::as_slice)
+    }
+
+    pub fn render_svg(&self) -> String {
+        render_svg::<NodeId, EdgeId>(self)
+    }
+
+    pub fn render_svg_with_labels<F>(&self, label_for: F) -> String
+    where
+        F: FnMut(NodeId) -> String,
+    {
+        render_svg_with_labels::<NodeId, EdgeId, F>(self, label_for)
+    }
+
+    pub fn render_html(&self, title: &str) -> String {
+        render_html::<NodeId, EdgeId>(self, title)
+    }
+
+    pub fn render_html_with_labels<F>(&self, title: &str, label_for: F) -> String
+    where
+        F: FnMut(NodeId) -> String,
+    {
+        render_html_with_labels::<NodeId, EdgeId, F>(self, title, label_for)
+    }
+}
+
+// ── Internal working graph ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+pub(crate) struct NodeLayoutData {
+    pub width: f64,
+    pub height: f64,
+    pub rank: i64,
+    pub order: usize,
+    pub x: f64,
+    pub y: f64,
+    pub is_dummy: bool,
+    /// Number of self-loop edges drawn off this node's right face. Each reserves
+    /// horizontal room (see [`loop_reserve`]) so the loops clear the right
+    /// neighbour, mirroring how back-edges reserve a wrap column.
+    pub self_loops: u32,
+}
+
+impl Default for NodeLayoutData {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_NODE_SIZE,
+            height: DEFAULT_NODE_SIZE,
+            rank: 0,
+            order: 0,
+            x: 0.0,
+            y: 0.0,
+            is_dummy: false,
+            self_loops: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct EdgeLayoutData {
+    pub minlen: i64,
+    pub weight: i64,
+    /// True if this edge was reversed to break a cycle (drawn back-to-front).
+    pub reversed: bool,
+    /// The caller's original edge id (as `usize`) this internal edge belongs to.
+    pub orig: usize,
+}
+
+impl Default for EdgeLayoutData {
+    fn default() -> Self {
+        Self {
+            minlen: 1,
+            weight: 1,
+            reversed: false,
+            orig: 0,
+        }
+    }
+}
+
+pub(crate) type LayoutGraph = OwningGraph<usize, usize, NodeLayoutData, EdgeLayoutData>;
+
+/// Rank read as a layer index (ranks are normalised non-negative before use).
+pub(crate) fn layer_of(graph: &LayoutGraph, node: usize) -> usize {
+    graph.get_node(node).unwrap().rank.max(0) as usize
+}
+
+// ── Builder ─────────────────────────────────────────────────────────────────
+
+pub struct LayoutBuilder<'g, NodeId, EdgeId, NodeData, EdgeData>
+where
+    NodeId: Identifier,
+    EdgeId: Identifier,
+{
+    graph: &'g OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    root: Option<NodeId>,
+    settings: LayoutSettings,
+    geometry: Box<dyn FnMut(NodeId) -> NodeGeometry + 'g>,
+}
+
+impl<'g, NodeId, EdgeId, NodeData, EdgeData> LayoutBuilder<'g, NodeId, EdgeId, NodeData, EdgeData>
+where
+    NodeId: Identifier + Debug,
+    EdgeId: Identifier + Debug,
+{
+    pub fn new(graph: &'g OwningGraph<NodeId, EdgeId, NodeData, EdgeData>) -> Self {
+        Self {
+            graph,
+            root: None,
+            settings: LayoutSettings::default(),
+            geometry: Box::new(|_| NodeGeometry::default()),
+        }
+    }
+
+    /// Preferred root: nodes in its component are seeded from it. Optional —
+    /// other components fall back to their min-id node.
+    pub fn root(mut self, root: NodeId) -> Self {
+        self.root = Some(root);
+        self
+    }
+
+    pub fn node_gap(mut self, gap: f64) -> Self {
+        self.settings.node_gap = gap;
+        self
+    }
+
+    pub fn layer_gap(mut self, gap: f64) -> Self {
+        self.settings.layer_gap = gap;
+        self
+    }
+
+    pub fn edge_style(mut self, style: EdgeStyle) -> Self {
+        self.settings.edge_style = style;
+        self
+    }
+
+    pub fn max_sweeps(mut self, sweeps: usize) -> Self {
+        self.settings.max_sweeps = sweeps;
+        self
+    }
+
+    pub fn settings(mut self, settings: LayoutSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    pub fn geometry<F>(mut self, geometry: F) -> Self
+    where
+        F: FnMut(NodeId) -> NodeGeometry + 'g,
+    {
+        self.geometry = Box::new(geometry);
+        self
+    }
+
+    pub fn build(mut self) -> Result<LayoutResult<NodeId, EdgeId>, LayoutError> {
+        let mut node_ids: Vec<NodeId> = self.graph.nodes().map(|n| n.id()).collect();
+        node_ids.sort_by_key(|id| Into::<usize>::into(*id));
+        if node_ids.is_empty() {
+            return Err(LayoutError::EmptyGraph);
+        }
+
+        let mut geometry = HashMap::default();
+        for id in &node_ids {
+            let g = (self.geometry)(*id);
+            geometry.insert(
+                *id,
+                NodeGeometry {
+                    width: g.width.max(1.0),
+                    height: g.height.max(1.0),
+                },
+            );
+        }
+
+        let components = weakly_connected_components(self.graph, &node_ids);
+
+        let mut nodes = HashMap::default();
+        let mut edges = HashMap::default();
+        let mut x_offset = 0.0f64;
+
+        for component in components {
+            let local =
+                layout_component(self.graph, &component, &geometry, self.root, &self.settings);
+
+            let (min_x, max_x, min_y) = local_bounds(&local);
+            let shift_x = x_offset - min_x;
+            let shift_y = -min_y;
+
+            for (id, mut node) in local.nodes {
+                node.x += shift_x;
+                node.y += shift_y;
+                nodes.insert(id, node);
+            }
+            for (id, points) in local.edges {
+                edges.insert(
+                    id,
+                    points
+                        .into_iter()
+                        .map(|p| Point {
+                            x: p.x + shift_x,
+                            y: p.y + shift_y,
+                        })
+                        .collect(),
+                );
+            }
+
+            x_offset += (max_x - min_x) + self.settings.node_gap;
+        }
+
+        Ok(LayoutResult { nodes, edges })
+    }
+}
+
+// ── Per-component pipeline ──────────────────────────────────────────────────
+
+struct ComponentLayout<NodeId: Identifier, EdgeId: Identifier> {
+    nodes: HashMap<NodeId, LayoutNode<NodeId>>,
+    edges: HashMap<EdgeId, Vec<Point>>,
+}
+
+fn layout_component<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    component: &[NodeId],
+    geometry: &HashMap<NodeId, NodeGeometry>,
+    preferred_root: Option<NodeId>,
+    settings: &LayoutSettings,
+) -> ComponentLayout<NodeId, EdgeId>
+where
+    NodeId: Identifier + Debug,
+    EdgeId: Identifier + Debug,
+{
+    // Build an internal usize-id graph for this component, recording the
+    // mapping back to the caller's node/edge ids.
+    let mut local = LayoutGraph::default();
+    let mut to_local: HashMap<NodeId, usize> = HashMap::default();
+    let mut to_orig: HashMap<usize, NodeId> = HashMap::default();
+
+    let mut sorted: Vec<NodeId> = component.to_vec();
+    sorted.sort_by_key(|id| Into::<usize>::into(*id));
+    for id in &sorted {
+        let geom = geometry[id];
+        let local_id = local.make_node(NodeLayoutData {
+            width: geom.width,
+            height: geom.height,
+            ..Default::default()
+        });
+        to_local.insert(*id, local_id);
+        to_orig.insert(local_id, *id);
+    }
+
+    let in_component: HashSet<NodeId> = component.iter().copied().collect();
+    // Self-loops are kept out of the layered graph (they would be degenerate
+    // rank-0 cycles); instead each is drawn as a loop off its node's right face,
+    // recorded here as (original edge id, local node id) in edge-id order.
+    let mut self_loops: Vec<(EdgeId, usize)> = Vec::new();
+    let mut edge_ids: Vec<EdgeId> = graph.edges().map(|e| e.id()).collect();
+    edge_ids.sort_by_key(|id| Into::<usize>::into(*id));
+    for edge_id in edge_ids {
+        let edge = graph.get_edge(edge_id).unwrap();
+        let from = edge.from_id();
+        let to = edge.to_id();
+        if !in_component.contains(&from) {
+            continue; // cross-component edges impossible
+        }
+        if from == to {
+            let node = to_local[&from];
+            local.get_node_mut(node).unwrap().self_loops += 1;
+            self_loops.push((edge_id, node));
+            continue;
+        }
+        local.make_edge(
+            to_local[&from],
+            to_local[&to],
+            EdgeLayoutData {
+                orig: edge_id.into(),
+                ..Default::default()
+            },
+        );
+    }
+
+    // Pick a deterministic root: the preferred root if it lives here, else the
+    // component's min-id node.
+    let root_local = preferred_root
+        .filter(|r| in_component.contains(r))
+        .map(|r| to_local[&r])
+        .unwrap_or_else(|| to_local[&sorted[0]]);
+
+    cycle::break_cycles(&mut local, root_local);
+    rank::assign_ranks(&mut local);
+    let seg = segment::build_segments(&mut local);
+    let ordering = order::order(&mut local, &seg, root_local, settings.max_sweeps);
+    coordinate::assign_x(&mut local, &seg, &ordering, settings.node_gap);
+    align_gadget_endpoints(&mut local);
+    assign_y(&mut local, &ordering.layers, settings.layer_gap);
+
+    let waypoints = match settings.edge_style {
+        EdgeStyle::Orthogonal => OrthogonalRouter.route(&local, &ordering.layers),
+        EdgeStyle::Straight => StraightRouter.route(&local, &ordering.layers),
+    };
+
+    let mut nodes = HashMap::default();
+    for local_id in to_orig.keys().copied() {
+        let node = local.get_node(local_id).unwrap();
+        let orig = to_orig[&local_id];
+        nodes.insert(
+            orig,
+            LayoutNode {
+                id: orig,
+                x: node.x,
+                y: node.y,
+                width: node.width,
+                height: node.height,
+            },
+        );
+    }
+
+    let mut edges = HashMap::default();
+    for (orig, points) in waypoints {
+        edges.insert(EdgeId::from(orig), points);
+    }
+
+    // Lay out the self-loops over their node's reserved right margin. Multiple
+    // loops on one node nest, drawn in stable edge-id order.
+    let mut loop_index: HashMap<usize, u32> = HashMap::default();
+    for (edge_id, node_id) in self_loops {
+        let node = local.get_node(node_id).unwrap();
+        let total = node.self_loops;
+        let index = loop_index.entry(node_id).or_insert(0);
+        let points = self_loop_waypoints(node.x, node.y, node.width, node.height, *index, total);
+        *index += 1;
+        edges.insert(edge_id, points);
+    }
+
+    ComponentLayout { nodes, edges }
+}
+
+/// Snaps each back-edge gadget's virtual endpoints (`A'`, `B'`) onto their wrap
+/// column after x-assignment. Brandes–Köpf places `A'`/`B'` by averaging the pull
+/// of their real attach node and their column dummy, leaving them mid-way and
+/// kinking the column; aligning them to the column dummy makes the column one
+/// straight vertical and each attach edge a single jog. They are virtual (not
+/// rendered), so only the routed polyline is affected.
+fn align_gadget_endpoints(graph: &mut LayoutGraph) {
+    let is_dummy = |g: &LayoutGraph, id: usize| g.get_node(id).unwrap().is_dummy;
+    let ids: Vec<usize> = graph
+        .nodes()
+        .filter(|n| n.is_dummy)
+        .map(|n| n.id())
+        .collect();
+
+    for id in ids {
+        let node = graph.get_node(id).unwrap();
+        // A back-edge gadget endpoint joins a real node and a column dummy via
+        // `reversed` edges. A' has them as children (out), B' as parents (in).
+        // Snap onto the column-dummy side.
+        let column_child = node
+            .children()
+            .find(|c| graph.get_edge(c.edge_id()).unwrap().reversed && is_dummy(graph, c.node_id()))
+            .map(|c| c.node_id());
+        let real_child = node.children().any(|c| {
+            graph.get_edge(c.edge_id()).unwrap().reversed && !is_dummy(graph, c.node_id())
+        });
+        let column_parent = node
+            .parents()
+            .find(|p| graph.get_edge(p.edge_id()).unwrap().reversed && is_dummy(graph, p.node_id()))
+            .map(|p| p.node_id());
+        let real_parent = node.parents().any(|p| {
+            graph.get_edge(p.edge_id()).unwrap().reversed && !is_dummy(graph, p.node_id())
+        });
+
+        let column = if real_child {
+            column_child // A'
+        } else if real_parent {
+            column_parent // B'
+        } else {
+            None
+        };
+        if let Some(col) = column {
+            let x = graph.get_node(col).unwrap().x;
+            graph.get_node_mut(id).unwrap().x = x;
+        }
+    }
+}
+
+/// Assigns each node a y by rank, using the tallest node in each rank so bends
+/// never fall inside a neighbouring rank's bounding box.
+fn assign_y(graph: &mut LayoutGraph, layers: &[Vec<usize>], layer_gap: f64) {
+    let mut max_h = vec![0.0f64; layers.len()];
+    for (rank, nodes) in layers.iter().enumerate() {
+        for &id in nodes {
+            max_h[rank] = max_h[rank].max(graph.get_node(id).unwrap().height);
+        }
+    }
+
+    let mut centers = vec![0.0f64; layers.len()];
+    for rank in 1..layers.len() {
+        centers[rank] = centers[rank - 1] + (max_h[rank - 1] + max_h[rank]) / 2.0 + layer_gap;
+    }
+
+    for (rank, nodes) in layers.iter().enumerate() {
+        for &id in nodes {
+            graph.get_node_mut(id).unwrap().y = centers[rank];
+        }
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn weakly_connected_components<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    sorted_ids: &[NodeId],
+) -> Vec<Vec<NodeId>>
+where
+    NodeId: Identifier + Debug,
+    EdgeId: Identifier + Debug,
+{
+    let mut seen: HashSet<NodeId> = HashSet::default();
+    let mut components = Vec::new();
+    for &start in sorted_ids {
+        if seen.contains(&start) {
+            continue;
+        }
+        let mut component: Vec<NodeId> = graph
+            .undirected_dfs(start)
+            .map(|(_, node)| node.id())
+            .collect();
+        component.sort_by_key(|id| Into::<usize>::into(*id));
+        for id in &component {
+            seen.insert(*id);
+        }
+        components.push(component);
+    }
+    components
+}
+
+fn local_bounds<NodeId: Identifier, EdgeId: Identifier>(
+    layout: &ComponentLayout<NodeId, EdgeId>,
+) -> (f64, f64, f64) {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+
+    for node in layout.nodes.values() {
+        min_x = min_x.min(node.x - node.width / 2.0);
+        max_x = max_x.max(node.x + node.width / 2.0);
+        min_y = min_y.min(node.y - node.height / 2.0);
+    }
+    for point in layout.edges.values().flatten() {
+        min_x = min_x.min(point.x);
+        max_x = max_x.max(point.x);
+        min_y = min_y.min(point.y);
+    }
+
+    if !min_x.is_finite() {
+        return (0.0, 0.0, 0.0);
+    }
+    (min_x, max_x, min_y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jstd_derive::Identifier;
+
+    #[derive(Identifier)]
+    struct N(usize);
+    #[derive(Identifier)]
+    struct E(usize);
+    type G = OwningGraph<N, E, (), ()>;
+
+    fn geom() -> impl FnMut(N) -> NodeGeometry {
+        |_| NodeGeometry {
+            width: 60.0,
+            height: 30.0,
+        }
+    }
+
+    fn layout(graph: &G, root: N) -> LayoutResult<N, E> {
+        LayoutBuilder::new(graph)
+            .root(root)
+            .geometry(geom())
+            .build()
+            .expect("graph should lay out")
+    }
+
+    fn diamond() -> (G, N) {
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let c = g.make_node(());
+        let d = g.make_node(());
+        g.make_edge(a, b, ());
+        g.make_edge(a, c, ());
+        g.make_edge(b, d, ());
+        g.make_edge(c, d, ());
+        (g, a)
+    }
+
+    fn signature(result: &LayoutResult<N, E>) -> Vec<String> {
+        let mut nodes: Vec<_> = result.nodes.values().collect();
+        nodes.sort_by_key(|n| usize::from(n.id));
+        let mut lines: Vec<String> = nodes
+            .iter()
+            .map(|n| format!("n{}:{:.3},{:.3}", usize::from(n.id), n.x, n.y))
+            .collect();
+        let mut edges: Vec<_> = result.edges.iter().collect();
+        edges.sort_by_key(|(e, _)| usize::from(**e));
+        for (e, pts) in edges {
+            let s = pts
+                .iter()
+                .map(|p| format!("{:.3},{:.3}", p.x, p.y))
+                .collect::<Vec<_>>()
+                .join(";");
+            lines.push(format!("e{}:{s}", usize::from(*e)));
+        }
+        lines
+    }
+
+    fn assert_no_node_overlap(result: &LayoutResult<N, E>) {
+        let nodes: Vec<_> = result.nodes.values().collect();
+        for (i, a) in nodes.iter().enumerate() {
+            for b in nodes.iter().skip(i + 1) {
+                let sep_x = (a.x - b.x).abs() + 1e-6 >= (a.width + b.width) / 2.0;
+                let sep_y = (a.y - b.y).abs() + 1e-6 >= (a.height + b.height) / 2.0;
+                assert!(
+                    sep_x || sep_y,
+                    "nodes {} and {} overlap at ({:.2},{:.2}) / ({:.2},{:.2})",
+                    usize::from(a.id),
+                    usize::from(b.id),
+                    a.x,
+                    a.y,
+                    b.x,
+                    b.y
+                );
+            }
+        }
+    }
+
+    fn assert_no_edge_through_node(result: &LayoutResult<N, E>) {
+        let eps = 0.5;
+        for (edge_id, points) in &result.edges {
+            for seg in points.windows(2) {
+                let (p, q) = (seg[0], seg[1]);
+                let (xmin, xmax) = (p.x.min(q.x), p.x.max(q.x));
+                let (ymin, ymax) = (p.y.min(q.y), p.y.max(q.y));
+                for node in result.nodes.values() {
+                    let nx0 = node.x - node.width / 2.0;
+                    let nx1 = node.x + node.width / 2.0;
+                    let ny0 = node.y - node.height / 2.0;
+                    let ny1 = node.y + node.height / 2.0;
+                    let x_inside = xmax > nx0 + eps && xmin < nx1 - eps;
+                    let y_inside = ymax > ny0 + eps && ymin < ny1 - eps;
+                    if x_inside && y_inside {
+                        let touches_endpoint = points.first().is_some_and(|e| {
+                            (e.x - node.x).abs() < node.width / 2.0 + eps
+                                && (e.y - node.y).abs() < node.height / 2.0 + eps
+                        }) || points.last().is_some_and(|e| {
+                            (e.x - node.x).abs() < node.width / 2.0 + eps
+                                && (e.y - node.y).abs() < node.height / 2.0 + eps
+                        });
+                        assert!(
+                            touches_endpoint,
+                            "edge {} passes through node {}",
+                            usize::from(*edge_id),
+                            usize::from(node.id)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// No two horizontal edge segments (from distinct edges) may share a y while
+    /// their x-ranges overlap — that is the overlap the lane assignment removes.
+    fn assert_no_horizontal_overlap(result: &LayoutResult<N, E>) {
+        let eps = 1e-6;
+        // (edge id, y, x0, x1) for every horizontal segment.
+        let mut hsegs: Vec<(usize, f64, f64, f64)> = Vec::new();
+        for (edge_id, points) in &result.edges {
+            for seg in points.windows(2) {
+                let (p, q) = (seg[0], seg[1]);
+                if (p.y - q.y).abs() < eps && (p.x - q.x).abs() > eps {
+                    hsegs.push((usize::from(*edge_id), p.y, p.x.min(q.x), p.x.max(q.x)));
+                }
+            }
+        }
+        for (i, &(ea, ya, ax0, ax1)) in hsegs.iter().enumerate() {
+            for &(eb, yb, bx0, bx1) in hsegs.iter().skip(i + 1) {
+                if ea == eb || (ya - yb).abs() > eps {
+                    continue;
+                }
+                let overlap = ax0.max(bx0) + eps < ax1.min(bx1);
+                assert!(
+                    !overlap,
+                    "edges {ea} and {eb} have overlapping horizontal segments at y={ya:.2}: \
+                     [{ax0:.2},{ax1:.2}] vs [{bx0:.2},{bx1:.2}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crossing_edges_use_separate_horizontal_lanes() {
+        // a,b on rank 0; c,d on rank 1. a->d and b->c cross, so both jog across
+        // the same channel with overlapping x-ranges. They must land on
+        // different y-lanes rather than drawing over each other.
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let c = g.make_node(());
+        let d = g.make_node(());
+        g.make_edge(a, c, ());
+        g.make_edge(a, d, ());
+        g.make_edge(b, c, ());
+        g.make_edge(b, d, ());
+        let r = layout(&g, a);
+        assert_no_horizontal_overlap(&r);
+        assert_no_edge_through_node(&r);
+        assert_no_node_overlap(&r);
+    }
+
+    #[test]
+    fn non_overlapping_jogs_share_the_channel_midpoint() {
+        // In the diamond, a's two out-edges jog in channel 0 toward b (left) and
+        // c (right); their x-ranges do not overlap, so both keep lane 0 — the
+        // exact channel midpoint — confirming the lane pass is a no-op when there
+        // is nothing to deconflict.
+        let (g, root) = diamond();
+        let r = layout(&g, root);
+        let a = r.get_node(root).unwrap();
+        let any_child = r.nodes.values().find(|n| n.y > a.y).unwrap();
+        let midpoint = ((a.y + a.height / 2.0) + (any_child.y - any_child.height / 2.0)) / 2.0;
+        for points in r.edges.values() {
+            for seg in points.windows(2) {
+                let (p, q) = (seg[0], seg[1]);
+                let horizontal = (p.y - q.y).abs() < 1e-9 && (p.x - q.x).abs() > 1e-9;
+                // Only the top channel (a → b/c) sits at this midpoint.
+                if horizontal && (p.y - midpoint).abs() < 5.0 {
+                    assert!(
+                        (p.y - midpoint).abs() < 1e-6,
+                        "jog y {:.3} should equal channel midpoint {:.3}",
+                        p.y,
+                        midpoint
+                    );
+                }
+            }
+        }
+        assert_no_horizontal_overlap(&r);
+    }
+
+    #[test]
+    fn is_deterministic() {
+        let (g, root) = diamond();
+        let first = signature(&layout(&g, root));
+        for _ in 0..10 {
+            assert_eq!(first, signature(&layout(&g, root)));
+        }
+    }
+
+    #[test]
+    fn chain_ranks_increase_downward() {
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let c = g.make_node(());
+        g.make_edge(a, b, ());
+        g.make_edge(b, c, ());
+        let r = layout(&g, a);
+        let ay = r.get_node(a).unwrap().y;
+        let by = r.get_node(b).unwrap().y;
+        let cy = r.get_node(c).unwrap().y;
+        assert!(ay < by && by < cy, "{ay} {by} {cy}");
+    }
+
+    #[test]
+    fn diamond_has_no_overlap_and_clean_edges() {
+        let (g, root) = diamond();
+        let r = layout(&g, root);
+        assert_no_node_overlap(&r);
+        assert_no_edge_through_node(&r);
+        for points in r.edges.values() {
+            assert!(points.len() >= 2);
+        }
+    }
+
+    #[test]
+    fn long_edge_spans_with_dummies_and_renders_once() {
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let c = g.make_node(());
+        let d = g.make_node(());
+        g.make_edge(a, b, ());
+        g.make_edge(b, c, ());
+        g.make_edge(c, d, ());
+        let long = g.make_edge(a, d, ());
+        let r = layout(&g, a);
+        assert!(r.get_waypoints(long).unwrap().len() >= 2);
+        let svg = r.render_svg();
+        let marker = format!("data-edge-id=\"{}\"", usize::from(long));
+        assert_eq!(svg.matches(&marker).count(), 1);
+    }
+
+    #[test]
+    fn orthogonal_router_yields_right_angles() {
+        let (g, root) = diamond();
+        let r = layout(&g, root);
+        for points in r.edges.values() {
+            for seg in points.windows(2) {
+                let axis_aligned =
+                    (seg[0].x - seg[1].x).abs() < 1e-6 || (seg[0].y - seg[1].y).abs() < 1e-6;
+                assert!(
+                    axis_aligned,
+                    "non-orthogonal segment {:?}->{:?}",
+                    seg[0], seg[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn back_edge_runs_upward_to_target() {
+        // a -> b -> c -> a : the back edge c->a should be drawn source(c)->target(a)
+        // travelling upward (first point lower than last).
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let c = g.make_node(());
+        g.make_edge(a, b, ());
+        g.make_edge(b, c, ());
+        let back = g.make_edge(c, a, ());
+        let r = layout(&g, a);
+        let pts = r.get_waypoints(back).unwrap();
+        assert!(
+            pts.first().unwrap().y > pts.last().unwrap().y,
+            "back edge should travel upward: {:?}",
+            pts
+        );
+
+        // It wraps around the end blocks: leaving the source (c) from its bottom
+        // and entering the target (a) at its top, like every forward edge.
+        let eps = 1e-6;
+        let src = r.get_node(c).unwrap();
+        let tgt = r.get_node(a).unwrap();
+        let start = pts.first().unwrap();
+        let end = pts.last().unwrap();
+        assert!(
+            (start.y - (src.y + src.height / 2.0)).abs() < eps,
+            "back edge should start at the source's bottom: {start:?} vs c={src:?}"
+        );
+        assert!(
+            (end.y - (tgt.y - tgt.height / 2.0)).abs() < eps,
+            "back edge should end at the target's top: {end:?} vs a={tgt:?}"
+        );
+        assert_no_edge_through_node(&r);
+    }
+
+    #[test]
+    fn adjacent_back_edge_wraps_without_dummies() {
+        // a <-> b : the back edge b->a is one rank apart, so it has no dummy
+        // column to reuse. It must still exit b's bottom and enter a's top,
+        // wrapping around the side, and pass through no node.
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        g.make_edge(a, b, ());
+        let back = g.make_edge(b, a, ());
+        let r = layout(&g, a);
+        let pts = r.get_waypoints(back).unwrap();
+        let eps = 1e-6;
+        let src = r.get_node(b).unwrap();
+        let tgt = r.get_node(a).unwrap();
+        let start = pts.first().unwrap();
+        let end = pts.last().unwrap();
+        assert!(
+            (start.y - (src.y + src.height / 2.0)).abs() < eps,
+            "back edge should start at the source's bottom: {start:?} vs b={src:?}"
+        );
+        assert!(
+            (end.y - (tgt.y - tgt.height / 2.0)).abs() < eps,
+            "back edge should end at the target's top: {end:?} vs a={tgt:?}"
+        );
+        assert_no_edge_through_node(&r);
+    }
+
+    #[test]
+    fn back_edge_keeps_source_port_on_the_bottom_fan() {
+        // top -> s, s -> a, s -> b, and the back edge s -> top. All three edges
+        // leaving s (two forward, one back) must fan across s's BOTTOM face — the
+        // back edge counts as an exit, not as if s still had one fewer.
+        let mut g = G::default();
+        let top = g.make_node(());
+        let s = g.make_node(());
+        let a = g.make_node(());
+        let b = g.make_node(());
+        g.make_edge(top, s, ());
+        let e_a = g.make_edge(s, a, ());
+        let e_b = g.make_edge(s, b, ());
+        let e_back = g.make_edge(s, top, ()); // back edge: top is s's ancestor
+        let r = layout(&g, top);
+
+        let sn = r.get_node(s).unwrap();
+        let bottom_y = sn.y + sn.height / 2.0;
+        let eps = 1e-6;
+
+        // Each edge's endpoint that touches s is the one at s's bottom face. For
+        // forward edges that's the first point; for the reversed edge the polyline
+        // runs s -> top, so it is also the first point (s is its source).
+        let port_x = |edge| {
+            let pts = r.get_waypoints(edge).unwrap();
+            let p = pts.first().unwrap();
+            assert!(
+                (p.y - bottom_y).abs() < eps,
+                "edge should leave s's bottom: {p:?} vs y={bottom_y}"
+            );
+            p.x
+        };
+        let mut xs = [port_x(e_a), port_x(e_b), port_x(e_back)];
+        xs.sort_by(f64::total_cmp);
+
+        // The bottom face fans three edges across three slots — one each in the
+        // left, middle and right third of s's width. Under the old (broken)
+        // assignment the back edge would have counted on the TOP face, leaving
+        // only a two-slot fan and the back edge starting at s's top instead.
+        let half = sn.width / 2.0;
+        assert!(
+            xs[0] < sn.x - half / 4.0
+                && (xs[1] - sn.x).abs() <= half / 2.0
+                && xs[2] > sn.x + half / 4.0,
+            "the three exits should fan across s's bottom in distinct slots: {xs:?} (s.x={})",
+            sn.x
+        );
+        for p in xs {
+            assert!(
+                p >= sn.x - half - eps && p <= sn.x + half + eps,
+                "port {p} outside s's width [{}, {}]",
+                sn.x - half,
+                sn.x + half
+            );
+        }
+        assert_no_edge_through_node(&r);
+    }
+
+    #[test]
+    fn multiple_back_edges_into_one_node_wrap_cleanly() {
+        // a -> b, b -> c, b -> d, c -> a, d -> a : two back edges (c->a and d->a)
+        // both target a. Each must wrap into a's top through its own reserved
+        // lane, leaving its source's bottom, and clip no node.
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let c = g.make_node(());
+        let d = g.make_node(());
+        g.make_edge(a, b, ());
+        g.make_edge(b, c, ());
+        g.make_edge(b, d, ());
+        let back_c = g.make_edge(c, a, ());
+        let back_d = g.make_edge(d, a, ());
+        let r = layout(&g, a);
+
+        let eps = 1e-6;
+        let tgt = r.get_node(a).unwrap();
+        let mut top_ports = Vec::new();
+        for (src_id, back) in [(c, back_c), (d, back_d)] {
+            let pts = r.get_waypoints(back).unwrap();
+            let src = r.get_node(src_id).unwrap();
+            let start = pts.first().unwrap();
+            let end = pts.last().unwrap();
+            assert!(
+                (start.y - (src.y + src.height / 2.0)).abs() < eps,
+                "back edge should leave the source's bottom: {start:?}"
+            );
+            assert!(
+                (end.y - (tgt.y - tgt.height / 2.0)).abs() < eps,
+                "back edge should enter the target's top: {end:?}"
+            );
+            top_ports.push(end.x);
+        }
+        assert!(
+            (top_ports[0] - top_ports[1]).abs() > eps,
+            "the two back edges must enter a's top at distinct ports: {top_ports:?}"
+        );
+        assert_no_edge_through_node(&r);
+        assert_no_node_overlap(&r);
+    }
+
+    #[test]
+    fn long_back_edge_has_a_straight_column() {
+        // a -> b -> c -> d -> e with the back edge e -> a spanning every rank.
+        // Its gadget should draw as a single straight vertical column with one
+        // jog at each end: source bottom -> down -> column -> up -> top jog ->
+        // target top (six points).
+        let mut g = G::default();
+        let n: Vec<_> = (0..5).map(|_| g.make_node(())).collect();
+        for w in n.windows(2) {
+            g.make_edge(w[0], w[1], ());
+        }
+        let back = g.make_edge(n[4], n[0], ());
+        let r = layout(&g, n[0]);
+        let pts = r.get_waypoints(back).unwrap();
+        assert_eq!(
+            pts.len(),
+            6,
+            "a single long back edge should wrap with a straight column: {pts:?}"
+        );
+        // Points 2..3 are the column: vertical and spanning the ranks.
+        assert!(
+            (pts[2].x - pts[3].x).abs() < 1e-6,
+            "the column must be vertical: {pts:?}"
+        );
+        assert!(
+            (pts[2].y - pts[3].y).abs() > r.get_node(n[0]).unwrap().height,
+            "the column must span the ranks: {pts:?}"
+        );
+        assert_no_edge_through_node(&r);
+    }
+
+    #[test]
+    fn self_loop_is_rendered_off_the_right_face() {
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let loop_edge = g.make_edge(a, a, ());
+        g.make_edge(a, b, ());
+        let r = layout(&g, a);
+        assert_eq!(r.nodes.len(), 2);
+
+        // The loop is a polyline that leaves and re-enters a's right face.
+        let an = r.get_node(a).unwrap();
+        let pts = r.get_waypoints(loop_edge).expect("self-loop must render");
+        assert!(
+            pts.len() >= 4,
+            "self-loop should be a loop polyline: {pts:?}"
+        );
+        let right = an.x + an.width / 2.0;
+        let eps = 1e-6;
+        assert!(
+            (pts.first().unwrap().x - right).abs() < eps
+                && (pts.last().unwrap().x - right).abs() < eps,
+            "loop must attach to the right face at x={right}: {pts:?}"
+        );
+        // It protrudes to the right of the node and stays within its height band.
+        assert!(
+            pts.iter().any(|p| p.x > right + eps),
+            "loop must protrude rightward: {pts:?}"
+        );
+        for p in pts {
+            assert!(
+                p.y >= an.y - an.height / 2.0 - eps && p.y <= an.y + an.height / 2.0 + eps,
+                "loop must stay within the node's height band: {p:?}"
+            );
+        }
+
+        // The reserved margin keeps the loop clear of the other node.
+        assert_no_node_overlap(&r);
+    }
+
+    #[test]
+    fn self_loop_reserves_room_from_neighbours() {
+        // a has a self-loop and a wide right neighbour `c`; the loop must not
+        // collide with c. b/c sit on the rank below a.
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let c = g.make_node(());
+        let loop_edge = g.make_edge(a, a, ());
+        g.make_edge(a, b, ());
+        g.make_edge(a, c, ());
+        let r = layout(&g, a);
+        let an = r.get_node(a).unwrap();
+        let loop_max_x = r
+            .get_waypoints(loop_edge)
+            .unwrap()
+            .iter()
+            .map(|p| p.x)
+            .fold(f64::NEG_INFINITY, f64::max);
+        // The loop protrudes past the node's right edge but the reservation is
+        // accounted for in spacing, so no node box is crossed by it.
+        assert!(loop_max_x > an.x + an.width / 2.0);
+        assert_no_edge_through_node(&r);
+    }
+
+    #[test]
+    fn disconnected_components_pack_without_overlap() {
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let c = g.make_node(());
+        let d = g.make_node(());
+        g.make_edge(a, b, ());
+        g.make_edge(c, d, ());
+        let r = layout(&g, a);
+        assert_no_node_overlap(&r);
+        // Two components: their x-extents must not interleave.
+        let comp1_max = r.get_node(a).unwrap().x.max(r.get_node(b).unwrap().x);
+        let comp2_min = r.get_node(c).unwrap().x.min(r.get_node(d).unwrap().x);
+        assert!(comp2_min > comp1_max, "components overlap horizontally");
+    }
+
+    #[test]
+    fn variable_width_nodes_do_not_overlap() {
+        let mut g = G::default();
+        let a = g.make_node(());
+        let wide = g.make_node(());
+        let narrow = g.make_node(());
+        let d = g.make_node(());
+        g.make_edge(a, wide, ());
+        g.make_edge(a, narrow, ());
+        g.make_edge(wide, d, ());
+        g.make_edge(narrow, d, ());
+        let r = LayoutBuilder::new(&g)
+            .root(a)
+            .geometry(move |id| {
+                let w = if id == wide { 200.0 } else { 40.0 };
+                NodeGeometry {
+                    width: w,
+                    height: 30.0,
+                }
+            })
+            .build()
+            .unwrap();
+        assert_no_node_overlap(&r);
+        assert_no_edge_through_node(&r);
+    }
+
+    #[test]
+    fn long_edge_segment_avoids_wide_intermediate_node() {
+        // Chain a..e over 5 ranks plus a long edge a->e spanning all of them.
+        // Its q-vertex/segment passes through rank 2 where `c` is very wide; the
+        // segment lane must route clear of c (the container-reserves-width
+        // guarantee the old x-assignment violated).
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let c = g.make_node(());
+        let d = g.make_node(());
+        let e = g.make_node(());
+        g.make_edge(a, b, ());
+        g.make_edge(b, c, ());
+        g.make_edge(c, d, ());
+        g.make_edge(d, e, ());
+        g.make_edge(a, e, ());
+        let r = LayoutBuilder::new(&g)
+            .root(a)
+            .geometry(move |id| {
+                let w = if id == c { 220.0 } else { 40.0 };
+                NodeGeometry {
+                    width: w,
+                    height: 30.0,
+                }
+            })
+            .build()
+            .unwrap();
+        assert_no_node_overlap(&r);
+        assert_no_edge_through_node(&r);
+    }
+
+    #[test]
+    fn root_sits_above_its_back_edge_predecessor() {
+        // A 2-cycle where the entry is NOT the min-id node: pred(0) -> entry(1)
+        // and entry(1) -> pred(0). Cycle-breaking rooted at `entry` must treat
+        // entry -> pred as forward and pred -> entry as the back-edge, so the
+        // entry lands on top — even though `pred` has the smaller id and the DFS
+        // would otherwise have started there and floated it above the entry.
+        let mut g = G::default();
+        let pred = g.make_node(());
+        let entry = g.make_node(());
+        g.make_edge(pred, entry, ());
+        g.make_edge(entry, pred, ());
+        let r = layout(&g, entry);
+        let ey = r.get_node(entry).unwrap().y;
+        let py = r.get_node(pred).unwrap().y;
+        assert!(
+            ey < py,
+            "entry (root) should sit above its back-edge predecessor: entry.y={ey} pred.y={py}"
+        );
+    }
+
+    #[test]
+    fn root_tops_loop_when_entry_has_higher_id() {
+        // entry(2) -> a(0) -> b(1) -> entry  : the latch b -> entry is the loop
+        // back-edge. With id-order cycle breaking the DFS would start at a(0) and
+        // misclassify, pushing a real block above the entry. Rooted at the entry,
+        // the entry is the unique top real node.
+        let mut g = G::default();
+        let a = g.make_node(());
+        let b = g.make_node(());
+        let entry = g.make_node(());
+        g.make_edge(entry, a, ());
+        g.make_edge(a, b, ());
+        g.make_edge(b, entry, ());
+        let r = layout(&g, entry);
+        let ey = r.get_node(entry).unwrap().y;
+        for (id, n) in &r.nodes {
+            if *id != entry {
+                assert!(
+                    ey <= n.y,
+                    "entry must be the top real node: entry.y={ey} node{}.y={}",
+                    usize::from(*id),
+                    n.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_graph_errors() {
+        let g = G::default();
+        let err = LayoutBuilder::new(&g).geometry(geom()).build().unwrap_err();
+        assert_eq!(err, LayoutError::EmptyGraph);
+    }
+}
