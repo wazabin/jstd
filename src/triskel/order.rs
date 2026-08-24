@@ -204,7 +204,7 @@ impl<'g> Context<'g> {
             neighbors.sort_unstable();
             let wish = if neighbors.is_empty() {
                 node.order as f64
-            } else if neighbors.len().is_multiple_of(2) {
+            } else if neighbors.len() % 2 == 0 {
                 let m = neighbors.len() / 2;
                 (neighbors[m - 1] + neighbors[m]) as f64 / 2.0
             } else {
