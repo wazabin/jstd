@@ -217,11 +217,26 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(node_error.line_number, 1);
+        assert_eq!(node_error.to_string(), "invalid node declaration on line 1");
 
         let edge_error = match TestGraph::parse("v0 -> [label]") {
             Ok(_) => panic!("edge declaration should fail"),
             Err(error) => error,
         };
         assert_eq!(edge_error.line_number, 1);
+        assert_eq!(edge_error.to_string(), "invalid edge declaration on line 1");
+    }
+
+    #[test]
+    fn lookup_helpers_find_parsed_items_and_skip_missing_ones() {
+        let graph = TestGraph::parse("\nalpha [Alpha]\nalpha -> beta [edge]\n")
+            .expect("parse should succeed");
+
+        let alpha = graph.get_node_by_name("Alpha").expect("node exists");
+        assert_eq!(*graph.get_node(alpha).unwrap().data(), "Alpha");
+        assert!(graph.get_node_by_name("missing").is_none());
+        let edge = graph.get_edge_by_data("edge").expect("edge exists");
+        assert_eq!(*graph.get_edge(edge).unwrap().data(), "edge");
+        assert!(graph.get_edge_by_data("missing").is_none());
     }
 }

@@ -610,4 +610,34 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn public_views_iteration_and_capacity_accounting_work() {
+        let mut arena = StableArena::<Id, i32>::default();
+        assert!(arena.is_empty());
+        assert_eq!(arena.structural_bytes(), 0);
+
+        let first = arena.push(1);
+        let second = arena.push(2);
+        let capacity_before = arena.capacity();
+        assert!(arena.structural_bytes() >= capacity_before * std::mem::size_of::<i32>());
+        assert_eq!(arena.get(first).unwrap().id, first);
+        **arena.get_mut(second).unwrap() = 20;
+        arena[first] = 10;
+        assert_eq!(arena[first], 10);
+        assert_eq!(arena[second], 20);
+
+        let mut entries = arena.iter();
+        assert_eq!(entries.size_hint(), (2, Some(2)));
+        assert_eq!(entries.next().unwrap().id, first);
+        assert_eq!(entries.next().unwrap().id, second);
+        assert!(entries.next().is_none());
+        assert!(format!("{arena:?}").contains("issued"));
+
+        let rebuilt: StableArena<Id, i32> = [3, 4].into_iter().collect();
+        assert_eq!(
+            rebuilt.iter().map(|entry| *entry.inner).collect::<Vec<_>>(),
+            [3, 4]
+        );
+    }
 }

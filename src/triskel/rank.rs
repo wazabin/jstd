@@ -354,3 +354,78 @@ fn balance(n: usize, edges: &[RankEdge], rank: &mut [i64]) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        graph::Graph,
+        triskel::layout::{EdgeLayoutData, NodeLayoutData},
+    };
+
+    fn edge(tail: usize, head: usize, minlen: i64, weight: i64) -> RankEdge {
+        RankEdge {
+            tail,
+            head,
+            minlen,
+            weight,
+        }
+    }
+
+    #[test]
+    fn network_simplex_returns_normalized_feasible_ranks() {
+        let edges = [
+            edge(0, 1, 2, 1),
+            edge(0, 2, 1, 3),
+            edge(1, 3, 1, 2),
+            edge(2, 3, 2, 1),
+        ];
+
+        let ranks = network_simplex(4, &edges);
+        assert_eq!(ranks.iter().min(), Some(&0));
+        for edge in edges {
+            assert!(edge.slack(&ranks) >= 0, "edge has negative slack");
+        }
+    }
+
+    #[test]
+    fn assign_ranks_handles_empty_isolated_and_weighted_graphs() {
+        let mut graph = LayoutGraph::default();
+        assign_ranks(&mut graph);
+
+        let isolated = graph.make_node(NodeLayoutData::default());
+        assign_ranks(&mut graph);
+        assert_eq!(graph.get_node(isolated).unwrap().rank, 0);
+
+        let mut graph = LayoutGraph::default();
+        let source = graph.make_node(NodeLayoutData::default());
+        let target = graph.make_node(NodeLayoutData::default());
+        graph.make_edge(
+            source,
+            target,
+            EdgeLayoutData {
+                minlen: 3,
+                weight: 2,
+                ..Default::default()
+            },
+        );
+        assign_ranks(&mut graph);
+
+        let source_rank = graph.get_node(source).unwrap().rank;
+        let target_rank = graph.get_node(target).unwrap().rank;
+        assert!(source_rank >= 0);
+        assert!(target_rank - source_rank >= 3);
+    }
+
+    #[test]
+    fn component_and_cut_values_respect_a_removed_tree_edge() {
+        let edges = [edge(0, 1, 1, 1), edge(1, 2, 1, 1), edge(0, 2, 1, 4)];
+        let tree: HashSet<usize> = [0, 1].into_iter().collect();
+        let head_component: HashSet<usize> = [2].into_iter().collect();
+        let tail_component: HashSet<usize> = [0, 1].into_iter().collect();
+
+        assert_eq!(component(3, &edges, &tree, 1, true), head_component);
+        assert_eq!(component(3, &edges, &tree, 1, false), tail_component);
+        assert_eq!(cut_values(3, &edges, &tree).get(&1), Some(&5));
+    }
+}

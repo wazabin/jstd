@@ -55,3 +55,33 @@ where
         self.map(|e| Intern::intern(e, pool))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::Registry;
+
+    #[test]
+    fn pool_deduplicates_strings_and_interns_nested_values() {
+        let mut pool = StringPool::default();
+        let first = pool.intern("shared");
+        let second = pool.intern("shared");
+        assert!(std::ptr::eq(first, second));
+
+        let values = vec![Some("shared"), None, Some("unique")].intern(&mut pool);
+        assert!(std::ptr::eq(values[0].unwrap(), first));
+        assert_eq!(values[1], None);
+        assert_eq!(values[2], Some("unique"));
+    }
+
+    #[test]
+    fn registry_interning_preserves_ids_and_values() {
+        let mut pool = StringPool::default();
+        let source: Registry<usize, &str> = ["left", "right"].into_iter().collect();
+        let interned = source.intern(&mut pool);
+
+        assert_eq!(interned.len(), 2);
+        assert_eq!(interned[0].to_string(), "left");
+        assert_eq!(interned[1].to_string(), "right");
+    }
+}

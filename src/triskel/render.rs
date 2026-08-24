@@ -134,3 +134,71 @@ pub(crate) fn render_html<NodeId: Identifier, EdgeId: Identifier>(
         Into::<usize>::into(node_id).to_string()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustc_hash::FxHashMap as HashMap;
+
+    use crate::triskel::layout::{LayoutNode, Point};
+
+    #[test]
+    fn renderers_escape_labels_sort_ids_and_emit_paths() {
+        let mut nodes = HashMap::default();
+        nodes.insert(
+            2_usize,
+            LayoutNode {
+                id: 2,
+                x: 50.0,
+                y: 20.0,
+                width: 30.0,
+                height: 10.0,
+            },
+        );
+        nodes.insert(
+            1_usize,
+            LayoutNode {
+                id: 1,
+                x: -10.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        );
+        let mut edges = HashMap::default();
+        edges.insert(
+            3_usize,
+            vec![Point { x: -10.0, y: 0.0 }, Point { x: 50.0, y: 20.0 }],
+        );
+        edges.insert(4, vec![Point { x: 0.0, y: 0.0 }]); // ignored: not a path
+        let layout = LayoutResult { nodes, edges };
+
+        let svg = render_svg_with_labels(&layout, |id| {
+            (if id == 1 { "<&>\"'" } else { "second\nline" }).into()
+        });
+        assert!(svg.contains("data-edge-id=\"3\""));
+        assert!(!svg.contains("data-edge-id=\"4\""));
+        assert!(svg.contains("&lt;&amp;&gt;&quot;&#39;"));
+        assert!(svg.contains("second</tspan><tspan"));
+        assert!(svg.find("<rect").unwrap() < svg.rfind("<rect").unwrap());
+
+        let default_svg = render_svg(&layout);
+        assert!(default_svg.contains(">1</tspan>"));
+        let html = render_html_with_labels(&layout, "<&>", |_| "label".into());
+        assert!(html.contains("<title>&lt;&amp;&gt;</title>"));
+        assert!(html.contains("<svg"));
+        assert!(render_html(&layout, "plain").contains("<title>plain</title>"));
+    }
+
+    #[test]
+    fn empty_layout_uses_the_minimum_view_box() {
+        let layout = LayoutResult::<usize, usize> {
+            nodes: HashMap::default(),
+            edges: HashMap::default(),
+        };
+        let svg = render_svg(&layout);
+        assert!(svg.contains("width=\"240\" height=\"180\""));
+        assert!(!svg.contains("<rect"));
+        assert!(!svg.contains("<path"));
+    }
+}

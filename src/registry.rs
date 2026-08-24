@@ -648,4 +648,38 @@ mod tests {
             "clone's chunk reallocated"
         );
     }
+
+    #[test]
+    fn public_views_iterators_and_serialization_preserve_values() {
+        let mut reg = Registry::<Id, i32>::default();
+        assert!(reg.is_empty());
+        let first = reg.push(10);
+        let second = reg.push(20);
+        assert_eq!(reg.get(first).id, first);
+        assert_eq!(**reg.get(second), 20);
+
+        let mut mutable = reg.get_mut(first);
+        **mutable += 5;
+        let immutable = mutable.immutable();
+        assert_eq!(immutable.id, first);
+        assert_eq!(**immutable, 15);
+        assert_eq!(format!("{immutable}"), "15");
+        assert_eq!(format!("{immutable:?}"), "15");
+
+        let mut borrowed = (&reg).into_iter();
+        assert_eq!(borrowed.size_hint(), (0, None));
+        assert_eq!(borrowed.next().unwrap().id, first);
+        assert_eq!(borrowed.next().unwrap().id, second);
+        assert!(borrowed.next().is_none());
+
+        let owned: Vec<_> = reg.clone().into_iter().map(|entry| entry.inner).collect();
+        assert_eq!(owned, [15, 20]);
+        assert_eq!(format!("{reg:?}"), "[15, 20]");
+
+        let bytes = bincode::serde::encode_to_vec(&reg, bincode::config::standard()).unwrap();
+        let (decoded, used): (Registry<Id, i32>, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded, reg);
+    }
 }

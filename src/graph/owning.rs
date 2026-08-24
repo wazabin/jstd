@@ -457,10 +457,13 @@ impl<NodeId: Identifier, EdgeId: Identifier, NodeData, EdgeData>
     /// # Panics
     /// Panics if the node does not exist.
     pub fn remove_node(&mut self, id: NodeId) {
-        let node = self.nodes.remove(&id).unwrap();
-        for edge_id in node.edges {
+        // Remove edges while the node is still present: `remove_edge` updates
+        // both endpoint incident-edge sets, including this node's.
+        let edges: Vec<EdgeId> = self.nodes[&id].edges.iter().copied().collect();
+        for edge_id in edges {
             self.remove_edge(edge_id);
         }
+        self.nodes.remove(&id).unwrap();
         self.node_data.remove(&id);
     }
 
@@ -499,7 +502,12 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::{
-        graph::{Graph, GraphMut, edge::Edge, node::Node, owning::OwningGraph},
+        graph::{
+            Graph, GraphMut,
+            edge::{Edge, EdgeMut},
+            node::{Node, NodeMut},
+            owning::OwningGraph,
+        },
         registry::Identifier,
     };
 
@@ -826,5 +834,68 @@ mod tests {
         assert!(!directed_seen.contains(&parent));
         assert!(undirected_seen.contains(&root));
         assert!(undirected_seen.contains(&parent));
+    }
+
+    #[test]
+    fn trait_views_traverse_and_mutate_edges_without_losing_connectivity() {
+        let mut graph = TestGraph::default();
+        let a = graph.make_node("a");
+        let b = graph.make_node("b");
+        let loop_node = graph.make_node("loop");
+        let edge = graph.make_edge(a, b, 1);
+        let loop_edge = graph.make_edge(loop_node, loop_node, 2);
+
+        let a_ref = graph.get_node(a).unwrap();
+        assert!(!a_ref.is_leaf());
+        assert_eq!(a_ref.edges().count(), 1);
+        let step = a_ref.children().next().unwrap();
+        assert_eq!(step.edge().id(), edge);
+        assert_eq!(step.node().id(), b);
+        assert!(graph.get_edge(loop_edge).unwrap().is_loop());
+
+        {
+            let mut a_mut = graph.get_node_mut(a).unwrap();
+            assert_eq!(a_mut.edge_count(), 1);
+            a_mut.remove_edge_id(edge);
+            assert!(a_mut.as_ref().is_leaf());
+            a_mut.add_edge_id(edge);
+            assert_eq!(a_mut.as_ref().edge_count(), 1);
+        }
+
+        {
+            let mut edge_mut = graph.get_edge_mut(edge).unwrap();
+            assert_eq!(edge_mut.as_ref().to_id(), b);
+            assert_eq!(edge_mut.from().id(), a);
+            assert_eq!(edge_mut.to().id(), b);
+            *edge_mut.data() = 9;
+            edge_mut.set_from(a);
+        }
+        assert_eq!(*graph.get_edge(edge).unwrap().data(), 9);
+    }
+
+    #[test]
+    fn editing_reinterpreting_and_removing_nodes_preserves_graph_invariants() {
+        let mut graph = TestGraph::default();
+        let a = graph.make_node("a");
+        let b = graph.make_node("b");
+        let c = graph.make_node("c");
+        let edge = graph.make_edge(a, b, 4);
+
+        graph.edit_edge(edge, b, c);
+        let edited = graph.get_edge(edge).unwrap();
+        assert_eq!(edited.from_id(), b);
+        assert_eq!(edited.to_id(), c);
+        assert_eq!(graph.get_node(a).unwrap().edge_count(), 0);
+        assert_eq!(graph.get_node(b).unwrap().edge_count(), 1);
+        assert_eq!(graph.get_node(c).unwrap().edge_count(), 1);
+
+        let reinterpreted = graph.reinterpret(|node| node.len(), |edge| edge * 10);
+        assert_eq!(*reinterpreted.get_node(a).unwrap().data(), 1);
+        assert_eq!(*reinterpreted.get_edge(edge).unwrap().data(), 40);
+
+        graph.remove_node(b);
+        assert!(graph.get_node(b).is_none());
+        assert!(graph.get_edge(edge).is_none());
+        assert_eq!(graph.get_node(c).unwrap().edge_count(), 0);
     }
 }

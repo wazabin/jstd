@@ -28,3 +28,29 @@ impl<'ctx, Ctx, Id: Identifier> From<BaseRef<&'ctx mut Ctx, Id>> for BaseRef<&'c
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BaseRef;
+
+    #[test]
+    fn constructors_keep_context_and_identifier() {
+        let reference = BaseRef::new("context", 7_usize);
+        let from_id = BaseRef::from_id("other", 9_usize);
+
+        assert_eq!(reference.ctx, "context");
+        assert_eq!(reference.id, 7);
+        assert_eq!(from_id.ctx, "other");
+        assert_eq!(from_id.id, 9);
+    }
+
+    #[test]
+    fn mutable_context_reference_converts_to_shared_reference() {
+        let mut context = String::from("context");
+        let mutable = BaseRef::new(&mut context, 3_usize);
+        let shared: BaseRef<&String, usize> = mutable.into();
+
+        assert_eq!(shared.id, 3);
+        assert_eq!(shared.ctx, "context");
+    }
+}
