@@ -38,3 +38,7 @@ proptest = "1"
 [[bench]]
 name = "stable_arena"
 harness = false
+
+[[bench]]
+name = "triskel"
+harness = false
