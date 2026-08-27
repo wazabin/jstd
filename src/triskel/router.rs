@@ -40,9 +40,19 @@ impl EdgeRouter for OrthogonalRouter {
 }
 
 impl EdgeRouter for StraightRouter {
-    fn route(&self, graph: &LayoutGraph, _layers: &[Vec<usize>]) -> HashMap<usize, Vec<Point>> {
+    fn route(&self, graph: &LayoutGraph, layers: &[Vec<usize>]) -> HashMap<usize, Vec<Point>> {
+        let chains = collect_chains(graph);
+        // A diagonal between otherwise valid anchors can still cut across a
+        // real node. In that case use the channel-aware router for the whole
+        // component, preserving its inter-edge lane deconfliction.
+        if chains
+            .iter()
+            .any(|(_, chain)| !straight_chain_is_safe(graph, chain))
+        {
+            return route_orthogonal(graph, layers);
+        }
         let mut out = HashMap::default();
-        for (orig, chain) in collect_chains(graph) {
+        for (orig, chain) in chains {
             let points = simplify(chain.anchors);
             if points.len() >= 2 {
                 out.insert(orig, points);
@@ -50,6 +60,35 @@ impl EdgeRouter for StraightRouter {
         }
         out
     }
+}
+
+fn straight_chain_is_safe(graph: &LayoutGraph, chain: &Chain) -> bool {
+    let (Some(&start), Some(&end)) = (chain.anchors.first(), chain.anchors.last()) else {
+        return false;
+    };
+    for node in graph.nodes().filter(|node| !node.is_dummy) {
+        let contains = |p: Point| {
+            p.x >= node.x - node.width / 2.0 - EPS
+                && p.x <= node.x + node.width / 2.0 + EPS
+                && p.y >= node.y - node.height / 2.0 - EPS
+                && p.y <= node.y + node.height / 2.0 + EPS
+        };
+        if contains(start) || contains(end) {
+            continue;
+        }
+        let xmin = node.x - node.width / 2.0;
+        let xmax = node.x + node.width / 2.0;
+        let ymin = node.y - node.height / 2.0;
+        let ymax = node.y + node.height / 2.0;
+        if chain.anchors.windows(2).any(|pair| {
+            let (x0, x1) = (pair[0].x.min(pair[1].x), pair[0].x.max(pair[1].x));
+            let (y0, y1) = (pair[0].y.min(pair[1].y), pair[0].y.max(pair[1].y));
+            x1 > xmin + EPS && x0 < xmax - EPS && y1 > ymin + EPS && y0 < ymax - EPS
+        }) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The source → target anchor chain of one original edge, plus per-anchor rank

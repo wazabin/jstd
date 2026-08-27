@@ -929,9 +929,7 @@ mod tests {
                 }
             }
             assert_no_node_overlap(&first);
-            if orthogonal {
-                assert_no_edge_through_nonincident_node(&first, &endpoints);
-            }
+            assert_no_edge_through_nonincident_node(&first, &endpoints);
         }
     }
 
