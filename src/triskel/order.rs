@@ -605,6 +605,84 @@ mod tests {
     }
 
     #[test]
+    fn crossing_score_matches_bruteforce_for_two_by_two_bipartite_graphs() {
+        let permutations = [[0usize, 1], [1, 0]];
+        for mask in 0u8..16 {
+            for top_order in permutations {
+                for bottom_order in permutations {
+                    let mut graph = LayoutGraph::default();
+                    let top: Vec<_> = (0..2)
+                        .map(|_| graph.make_node(NodeLayoutData::default()))
+                        .collect();
+                    let bottom: Vec<_> = (0..2)
+                        .map(|_| graph.make_node(NodeLayoutData::default()))
+                        .collect();
+                    let mut top_pos = [0usize; 2];
+                    let mut bottom_pos = [0usize; 2];
+                    for (position, index) in top_order.into_iter().enumerate() {
+                        top_pos[index] = position;
+                        graph.get_node_mut(top[index]).unwrap().order = position;
+                    }
+                    for (position, index) in bottom_order.into_iter().enumerate() {
+                        bottom_pos[index] = position;
+                        graph.get_node_mut(bottom[index]).unwrap().order = position;
+                    }
+                    let mut edges = Vec::new();
+                    for source in 0..2 {
+                        for target in 0..2 {
+                            if mask & (1 << (source * 2 + target)) != 0 {
+                                graph.make_edge(
+                                    top[source],
+                                    bottom[target],
+                                    EdgeLayoutData::default(),
+                                );
+                                edges.push((source, target));
+                            }
+                        }
+                    }
+                    let expected = edges
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(a_source, a_target))| {
+                            edges[i + 1..]
+                                .iter()
+                                .filter(|&&(b_source, b_target)| {
+                                    (top_pos[a_source] < top_pos[b_source]
+                                        && bottom_pos[a_target] > bottom_pos[b_target])
+                                        || (top_pos[a_source] > top_pos[b_source]
+                                            && bottom_pos[a_target] < bottom_pos[b_target])
+                                })
+                                .count()
+                        })
+                        .sum::<usize>();
+                    let lower = Layer {
+                        items: bottom_order
+                            .into_iter()
+                            .map(|i| Item::Vertex(bottom[i]))
+                            .collect(),
+                    };
+                    let upper = Layer {
+                        items: top_order
+                            .into_iter()
+                            .map(|i| Item::Vertex(top[i]))
+                            .collect(),
+                    };
+                    assert_eq!(
+                        context(&mut graph, false).count_crossings(&lower),
+                        expected,
+                        "downward mask={mask:04b}, top={top_order:?}, bottom={bottom_order:?}"
+                    );
+                    assert_eq!(
+                        context(&mut graph, true).count_crossings(&upper),
+                        expected,
+                        "upward mask={mask:04b}, top={top_order:?}, bottom={bottom_order:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn slots_contain_each_vertex_and_each_active_segment_lane_once() {
         let mut graph = LayoutGraph::default();
         let nodes: Vec<_> = (0..5)
