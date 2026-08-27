@@ -574,6 +574,8 @@ mod tests {
     use jstd_derive::Identifier;
     use proptest::prelude::*;
 
+    use crate::triskel::geometry::segment_enters_rect_strict;
+
     #[derive(Identifier)]
     struct N(usize);
     #[derive(Identifier)]
@@ -649,35 +651,20 @@ mod tests {
     }
 
     fn assert_no_edge_through_node(result: &LayoutResult<N, E>) {
-        let eps = 0.5;
         for (edge_id, points) in &result.edges {
             for (index, seg) in points.windows(2).enumerate() {
-                let (p, q) = (seg[0], seg[1]);
-                let (xmin, xmax) = (p.x.min(q.x), p.x.max(q.x));
-                let (ymin, ymax) = (p.y.min(q.y), p.y.max(q.y));
                 for node in result.nodes.values() {
-                    let nx0 = node.x - node.width / 2.0;
-                    let nx1 = node.x + node.width / 2.0;
-                    let ny0 = node.y - node.height / 2.0;
-                    let ny1 = node.y + node.height / 2.0;
-                    let x_inside = xmax > nx0 + eps && xmin < nx1 - eps;
-                    let y_inside = ymax > ny0 + eps && ymin < ny1 - eps;
-                    if !x_inside || !y_inside {
-                        continue;
-                    }
-                    // Only the incident segment may touch the node at its
-                    // corresponding endpoint. A later segment that re-enters
-                    // either endpoint node is still an illegal intersection.
-                    let on_node = |point: Point| {
-                        point.x >= nx0 - eps
-                            && point.x <= nx1 + eps
-                            && point.y >= ny0 - eps
-                            && point.y <= ny1 + eps
-                    };
-                    let allowed =
-                        (index == 0 && on_node(p)) || (index + 2 == points.len() && on_node(q));
                     assert!(
-                        allowed,
+                        !segment_enters_rect_strict(
+                            seg[0],
+                            seg[1],
+                            Point {
+                                x: node.x,
+                                y: node.y
+                            },
+                            node.width,
+                            node.height,
+                        ),
                         "edge {} segment {index} passes through node {}",
                         usize::from(*edge_id),
                         usize::from(node.id)
@@ -737,27 +724,24 @@ mod tests {
         result: &LayoutResult<N, E>,
         endpoints: &HashMap<E, (N, N)>,
     ) {
-        let eps = 0.5;
         for (edge_id, points) in &result.edges {
             let &(source, target) = endpoints.get(edge_id).expect("missing edge endpoint data");
             for seg in points.windows(2) {
-                let (p, q) = (seg[0], seg[1]);
-                let (xmin, xmax) = (p.x.min(q.x), p.x.max(q.x));
-                let (ymin, ymax) = (p.y.min(q.y), p.y.max(q.y));
                 for node in result.nodes.values() {
                     if node.id == source || node.id == target {
                         continue;
                     }
-                    let nx0 = node.x - node.width / 2.0;
-                    let nx1 = node.x + node.width / 2.0;
-                    let ny0 = node.y - node.height / 2.0;
-                    let ny1 = node.y + node.height / 2.0;
-                    let intersects = xmax > nx0 + eps
-                        && xmin < nx1 - eps
-                        && ymax > ny0 + eps
-                        && ymin < ny1 - eps;
                     assert!(
-                        !intersects,
+                        !segment_enters_rect_strict(
+                            seg[0],
+                            seg[1],
+                            Point {
+                                x: node.x,
+                                y: node.y
+                            },
+                            node.width,
+                            node.height,
+                        ),
                         "edge {} passes through non-incident node {}",
                         usize::from(*edge_id),
                         usize::from(node.id)
@@ -880,7 +864,48 @@ mod tests {
                 }
             }
             assert_no_node_overlap(&first);
+            assert_no_edge_through_node(&first);
             assert_no_edge_through_nonincident_node(&first, &endpoints);
+            if orthogonal {
+                assert_no_horizontal_overlap(&first);
+                assert_no_vertical_overlap(&first);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run explicitly as cargo test triskel_stress_generated_layouts -- --ignored"]
+    fn triskel_stress_generated_layouts() {
+        // 256 deterministic mixed graphs: cycles, self-loops, parallel edges,
+        // variable geometry, both routers, and disconnected vertices.
+        for seed in 0usize..256 {
+            let mut graph = G::default();
+            let count = 2 + seed % 10;
+            let nodes: Vec<_> = (0..count).map(|_| graph.make_node(())).collect();
+            let mut endpoints = HashMap::default();
+            for i in 0..(count * 3) {
+                let from = nodes[(seed.wrapping_mul(17) + i * 3) % count];
+                let to = nodes[(seed.wrapping_mul(7) + i * 5 + 1) % count];
+                let edge = graph.make_edge(from, to, ());
+                endpoints.insert(edge, (from, to));
+            }
+            let result = LayoutBuilder::new(&graph)
+                .root(nodes[seed % count])
+                .edge_style(if seed % 2 == 0 {
+                    EdgeStyle::Orthogonal
+                } else {
+                    EdgeStyle::Straight
+                })
+                .geometry(|id| NodeGeometry {
+                    width: 10.0 + (usize::from(id) % 7 * 23) as f64,
+                    height: 10.0 + (usize::from(id) % 5 * 13) as f64,
+                })
+                .build()
+                .unwrap();
+            assert_eq!(result.edges.len(), graph.edges().count(), "seed={seed}");
+            assert_no_node_overlap(&result);
+            assert_no_edge_through_node(&result);
+            assert_no_edge_through_nonincident_node(&result, &endpoints);
         }
     }
 

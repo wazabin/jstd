@@ -647,9 +647,61 @@ fn inner_upper(cells: &Cells, v: usize, r: usize) -> Option<i64> {
     None
 }
 
+/// Test-only phase contract: real ordering output must admit every mandatory
+/// segment equality and every adjacent-slot separation before coordinate
+/// assignment starts.
+#[cfg(test)]
+pub(crate) fn mandatory_constraints_feasible(
+    graph: &LayoutGraph,
+    seg: &SegmentInfo,
+    ordering: &Ordering,
+) -> bool {
+    let cells = build_cells(graph, seg, ordering);
+    let mut xs = vec![0.0; cells.rank.len()];
+    enforce_coordinate_constraints(&cells, &[], 1.0, &mut xs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordering_output_always_admits_mandatory_segment_constraints() {
+        // Two simultaneous/nested spans plus a cycle (the caller's cycle phase
+        // has already made it a back-edge gadget in normal layout) exercise the
+        // exact ordering→coordinate phase boundary with varied widths.
+        let mut graph = LayoutGraph::default();
+        let nodes: Vec<_> = (0..6)
+            .map(|i| {
+                graph.make_node(crate::triskel::layout::NodeLayoutData {
+                    width: 20.0 + (i * 37) as f64,
+                    height: 20.0,
+                    rank: i as i64,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        for pair in nodes.windows(2) {
+            graph.make_edge(
+                pair[0],
+                pair[1],
+                crate::triskel::layout::EdgeLayoutData::default(),
+            );
+        }
+        graph.make_edge(
+            nodes[0],
+            nodes[5],
+            crate::triskel::layout::EdgeLayoutData::default(),
+        );
+        graph.make_edge(
+            nodes[1],
+            nodes[4],
+            crate::triskel::layout::EdgeLayoutData::default(),
+        );
+        let seg = crate::triskel::segment::build_segments(&mut graph);
+        let ordering = crate::triskel::order::order(&mut graph, &seg, nodes[0], 4);
+        assert!(mandatory_constraints_feasible(&graph, &seg, &ordering));
+    }
 
     #[test]
     fn segment_constraint_keeps_complete_chain_together_and_clear_of_wide_slot() {

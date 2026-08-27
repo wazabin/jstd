@@ -14,7 +14,7 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
-    graph::{Graph, GraphMut, node::Node},
+    graph::{Graph, GraphMut, edge::Edge, node::Node},
     triskel::{
         layout::{LayoutGraph, layer_of},
         segment::SegmentInfo,
@@ -23,7 +23,7 @@ use crate::{
 
 /// One left-to-right element of a rank: a real/dummy vertex, or a segment lane
 /// passing through (identified by its q-vertex id).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Slot {
     Vertex(usize),
     Segment(usize),
@@ -140,7 +140,6 @@ impl<'g> Context<'g> {
             layer = self.merge(layer, child);
             self.extract_q(&mut layer, child);
             layer.normalize();
-            self.transpose(&mut layer);
             crossings += self.count_crossings(&layer);
         }
         self.assign_container_positions(&mut layer);
@@ -299,47 +298,6 @@ impl<'g> Context<'g> {
         }
     }
 
-    /// Local adjacent-swap refinement. Empty containers are structural
-    /// separators, not ordering elements, so candidate swaps operate on the
-    /// adjacent vertices/non-empty containers visible through them. Every
-    /// candidate is re-normalised and accepted only when it strictly improves
-    /// the same crossing objective used by the sweep.
-    fn transpose(&mut self, layer: &mut Layer) {
-        loop {
-            self.assign_container_positions(layer);
-            let current = self.count_crossings(layer);
-            let content: Vec<usize> = layer
-                .items
-                .iter()
-                .enumerate()
-                .filter_map(|(index, item)| match item {
-                    Item::Vertex(_) => Some(index),
-                    Item::Container(segments, _) if !segments.is_empty() => Some(index),
-                    Item::Container(_, _) => None,
-                })
-                .collect();
-            let mut accepted = None;
-            for pair in content.windows(2) {
-                let mut candidate = layer.clone();
-                candidate.items.swap(pair[0], pair[1]);
-                candidate.normalize();
-                self.assign_container_positions(&mut candidate);
-                let score = self.count_crossings(&candidate);
-                if score < current {
-                    accepted = Some(candidate);
-                    break;
-                }
-            }
-            if let Some(candidate) = accepted {
-                *layer = candidate;
-            } else {
-                // A rejected candidate temporarily rewrote current-rank orders.
-                self.assign_container_positions(layer);
-                break;
-            }
-        }
-    }
-
     /// step5: count crossings, treating each container as a block of `size`
     /// parallel segments.
     fn count_crossings(&self, layer: &Layer) -> usize {
@@ -426,12 +384,217 @@ pub(crate) fn order(
         ctx.order(&mut layering, max_sweeps.max(1));
     }
 
-    // Rebuild deterministic top-down layers + slots from the final orders.
+    // Rebuild deterministic top-down layers + slots from the sweep result,
+    // then refine slots against both boundaries of every affected rank.
     let layers = build_layers(graph, max_rank);
-    let slots = build_slots(graph, seg, &layers);
+    let mut slots = build_slots(graph, seg, &layers);
+    transpose_slots(graph, seg, &mut slots, false);
+    let layers = layers_from_slots(graph, &slots);
     debug_assert_slot_contract(graph, seg, &layers, &slots);
 
     Ordering { layers, slots }
+}
+
+/// Total adjacent-boundary crossing objective for materialised slots.  A long
+/// p→q segment contributes one connection at every boundary it spans, so this
+/// is the geometric objective affected by swapping a slot in an interior rank.
+fn slot_crossings(graph: &LayoutGraph, seg: &SegmentInfo, slots: &[Vec<Slot>]) -> usize {
+    let mut pos: Vec<HashMap<Slot, usize>> = vec![HashMap::default(); slots.len()];
+    for (rank, row) in slots.iter().enumerate() {
+        for (index, &slot) in row.iter().enumerate() {
+            pos[rank].insert(slot, index);
+        }
+    }
+    let mut by_boundary: Vec<Vec<(usize, usize)>> = vec![Vec::new(); slots.len().saturating_sub(1)];
+    let mut edge_ids: Vec<_> = graph.edges().map(|edge| edge.id()).collect();
+    edge_ids.sort_unstable();
+    for eid in edge_ids {
+        let edge = graph.get_edge(eid).unwrap();
+        let from = edge.from_id();
+        let to = edge.to_id();
+        let from_rank = layer_of(graph, from);
+        let to_rank = layer_of(graph, to);
+        if to_rank == from_rank + 1 {
+            by_boundary[from_rank].push((
+                pos[from_rank][&Slot::Vertex(from)],
+                pos[to_rank][&Slot::Vertex(to)],
+            ));
+        }
+    }
+    // The only non-adjacent internal edges are p→q segment edges.  Materialise
+    // their boundary crossings without materialising graph vertices.
+    let mut qids: Vec<_> = seg.qvertices.iter().copied().collect();
+    qids.sort_unstable();
+    for q in qids {
+        let p = graph
+            .get_node(q)
+            .unwrap()
+            .parents()
+            .next()
+            .unwrap()
+            .node_id();
+        let start = layer_of(graph, p);
+        let end = layer_of(graph, q);
+        for rank in start..end {
+            let left = if rank == start {
+                Slot::Vertex(p)
+            } else {
+                Slot::Segment(q)
+            };
+            let right = if rank + 1 == end {
+                Slot::Vertex(q)
+            } else {
+                Slot::Segment(q)
+            };
+            by_boundary[rank].push((pos[rank][&left], pos[rank + 1][&right]));
+        }
+    }
+    by_boundary
+        .iter()
+        .map(|edges| {
+            edges
+                .iter()
+                .enumerate()
+                .map(|(i, &(a0, b0))| {
+                    edges[i + 1..]
+                        .iter()
+                        .filter(|&&(a1, b1)| (a0 < a1 && b0 > b1) || (a0 > a1 && b0 < b1))
+                        .count()
+                })
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Checks the hard equality/order system before coordinate assignment. Equality
+/// groups are p/lane/q chains; every adjacent slot creates a strictly-positive
+/// left→right difference constraint. A directed cycle is therefore exactly a
+/// mandatory-coordinate infeasibility.
+fn mandatory_slot_constraints_feasible(
+    graph: &LayoutGraph,
+    seg: &SegmentInfo,
+    slots: &[Vec<Slot>],
+) -> bool {
+    let mut cells = HashMap::default();
+    let mut n = 0usize;
+    for (rank, row) in slots.iter().enumerate() {
+        for &slot in row {
+            cells.insert((rank, slot), n);
+            n += 1;
+        }
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = find(parent, parent[x]);
+        }
+        parent[x]
+    }
+    let mut unite = |a: usize, b: usize| {
+        let a = find(&mut parent, a);
+        let b = find(&mut parent, b);
+        if a != b {
+            parent[b] = a;
+        }
+    };
+    let mut qids: Vec<_> = seg.qvertices.iter().copied().collect();
+    qids.sort_unstable();
+    for q in qids {
+        let p = graph
+            .get_node(q)
+            .unwrap()
+            .parents()
+            .next()
+            .unwrap()
+            .node_id();
+        let start = layer_of(graph, p);
+        let end = layer_of(graph, q);
+        let first = cells[&(start, Slot::Vertex(p))];
+        for rank in start + 1..end {
+            unite(first, cells[&(rank, Slot::Segment(q))]);
+        }
+        unite(first, cells[&(end, Slot::Vertex(q))]);
+    }
+    let groups: Vec<_> = (0..n).map(|i| find(&mut parent, i)).collect();
+    let mut outgoing = vec![Vec::new(); n];
+    let mut indegree = vec![0usize; n];
+    for (rank, row) in slots.iter().enumerate() {
+        for pair in row.windows(2) {
+            let a = groups[cells[&(rank, pair[0])]];
+            let b = groups[cells[&(rank, pair[1])]];
+            if a == b {
+                return false;
+            }
+            if !outgoing[a].contains(&b) {
+                outgoing[a].push(b);
+                indegree[b] += 1;
+            }
+        }
+    }
+    let mut ready: Vec<_> = (0..n)
+        .filter(|&i| i == groups[i] && indegree[i] == 0)
+        .collect();
+    let mut visited = 0;
+    while let Some(i) = ready.pop() {
+        visited += 1;
+        for &next in &outgoing[i] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                ready.push(next);
+            }
+        }
+    }
+    visited == (0..n).filter(|&i| i == groups[i]).count()
+}
+
+/// Deterministic local-swap pass. Each candidate is scored against **all** rank
+/// boundaries, not merely the boundary last visited by the sweep.  A swap that
+/// would make p/lane/q equality incompatible with slot separation is rejected.
+fn transpose_slots(graph: &LayoutGraph, seg: &SegmentInfo, slots: &mut [Vec<Slot>], reverse: bool) {
+    loop {
+        let before = slot_crossings(graph, seg, slots);
+        let ranks: Vec<_> = if reverse {
+            (0..slots.len()).rev().collect()
+        } else {
+            (0..slots.len()).collect()
+        };
+        let mut accepted = false;
+        'scan: for rank in ranks {
+            let indices: Vec<_> = if reverse {
+                (0..slots[rank].len().saturating_sub(1)).rev().collect()
+            } else {
+                (0..slots[rank].len().saturating_sub(1)).collect()
+            };
+            for index in indices {
+                slots[rank].swap(index, index + 1);
+                let feasible = mandatory_slot_constraints_feasible(graph, seg, slots);
+                let after = feasible.then(|| slot_crossings(graph, seg, slots));
+                if after.is_some_and(|score| score < before) {
+                    accepted = true;
+                    break 'scan;
+                }
+                slots[rank].swap(index, index + 1);
+            }
+        }
+        if !accepted {
+            break;
+        }
+    }
+}
+
+/// Synchronises vertex order with the final slot order.  Slot positions (rather
+/// than stale `NodeLayoutData::order`) are the authority after transpose.
+fn layers_from_slots(graph: &mut LayoutGraph, slots: &[Vec<Slot>]) -> Vec<Vec<usize>> {
+    let mut layers = vec![Vec::new(); slots.len()];
+    for (rank, row) in slots.iter().enumerate() {
+        for (order, slot) in row.iter().enumerate() {
+            if let Slot::Vertex(id) = *slot {
+                graph.get_node_mut(id).unwrap().order = order;
+                layers[rank].push(id);
+            }
+        }
+    }
+    layers
 }
 
 /// Phase boundary contract: materialised vertices occur once at their own rank;
@@ -671,28 +834,22 @@ mod tests {
         });
         graph.make_edge(a, d, EdgeLayoutData::default());
         graph.make_edge(b, c, EdgeLayoutData::default());
-        let mut layer = Layer {
-            items: vec![
-                Item::Container(Vec::new(), 0),
-                Item::Vertex(c),
-                Item::Container(Vec::new(), 0),
-                Item::Vertex(d),
-                Item::Container(Vec::new(), 0),
-            ],
+        let seg = SegmentInfo {
+            pvertices: HashSet::default(),
+            qvertices: HashSet::default(),
         };
-        let mut ctx = context(&mut graph, false);
-        assert_eq!(ctx.count_crossings(&layer), 1);
-        ctx.transpose(&mut layer);
-        assert_eq!(ctx.count_crossings(&layer), 0);
-        let vertices: Vec<_> = layer
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Vertex(id) => Some(*id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(vertices, vec![d, c]);
+        let mut slots = vec![
+            vec![Slot::Vertex(a), Slot::Vertex(b)],
+            vec![Slot::Vertex(c), Slot::Vertex(d)],
+        ];
+        assert_eq!(slot_crossings(&graph, &seg, &slots), 1);
+        transpose_slots(&graph, &seg, &mut slots, false);
+        assert_eq!(slot_crossings(&graph, &seg, &slots), 0);
+        assert!(
+            slots[0] == vec![Slot::Vertex(b), Slot::Vertex(a)]
+                || slots[1] == vec![Slot::Vertex(d), Slot::Vertex(c)],
+            "one endpoint rank must make the improving deterministic swap: {slots:?}"
+        );
     }
 
     #[test]
@@ -767,6 +924,82 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn transpose_scores_both_boundaries_and_is_direction_symmetric() {
+        // Swapping c/d fixes the top a→d, b→c crossing but creates the bottom
+        // c→e, d→f crossing. A one-sided transpose wrongly accepts it; the
+        // all-boundary objective is unchanged and must reject it.
+        let mut graph = LayoutGraph::default();
+        let ids: Vec<_> = (0..6)
+            .map(|i| {
+                graph.make_node(NodeLayoutData {
+                    rank: (i / 2) as i64,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        graph.make_edge(ids[0], ids[3], EdgeLayoutData::default());
+        graph.make_edge(ids[1], ids[2], EdgeLayoutData::default());
+        graph.make_edge(ids[2], ids[4], EdgeLayoutData::default());
+        graph.make_edge(ids[3], ids[5], EdgeLayoutData::default());
+        let seg = SegmentInfo {
+            pvertices: HashSet::default(),
+            qvertices: HashSet::default(),
+        };
+        let initial = vec![
+            vec![Slot::Vertex(ids[0]), Slot::Vertex(ids[1])],
+            vec![Slot::Vertex(ids[2]), Slot::Vertex(ids[3])],
+            vec![Slot::Vertex(ids[4]), Slot::Vertex(ids[5])],
+        ];
+        let before = slot_crossings(&graph, &seg, &initial);
+        assert_eq!(before, 1);
+        let mut forward = initial.clone();
+        let mut reverse = initial.clone();
+        transpose_slots(&graph, &seg, &mut forward, false);
+        transpose_slots(&graph, &seg, &mut reverse, true);
+        assert!(slot_crossings(&graph, &seg, &forward) <= before);
+        assert!(slot_crossings(&graph, &seg, &reverse) <= before);
+        // Outer ranks may independently improve, but the middle tie must not
+        // be accepted merely because one adjacent boundary improves.
+        assert_eq!(forward[1], initial[1]);
+        assert_eq!(reverse[1], initial[1]);
+    }
+
+    #[test]
+    fn transpose_handles_first_and_last_rank_and_never_worsens() {
+        let mut graph = LayoutGraph::default();
+        let top: Vec<_> = (0..2)
+            .map(|_| {
+                graph.make_node(NodeLayoutData {
+                    rank: 0,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let bottom: Vec<_> = (0..2)
+            .map(|_| {
+                graph.make_node(NodeLayoutData {
+                    rank: 1,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        graph.make_edge(top[0], bottom[1], EdgeLayoutData::default());
+        graph.make_edge(top[1], bottom[0], EdgeLayoutData::default());
+        let seg = SegmentInfo {
+            pvertices: HashSet::default(),
+            qvertices: HashSet::default(),
+        };
+        let mut slots = vec![
+            vec![Slot::Vertex(top[0]), Slot::Vertex(top[1])],
+            vec![Slot::Vertex(bottom[0]), Slot::Vertex(bottom[1])],
+        ];
+        let before = slot_crossings(&graph, &seg, &slots);
+        transpose_slots(&graph, &seg, &mut slots, false);
+        assert!(slot_crossings(&graph, &seg, &slots) <= before);
+        assert_eq!(slot_crossings(&graph, &seg, &slots), 0);
     }
 
     #[test]

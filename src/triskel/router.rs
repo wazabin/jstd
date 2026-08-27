@@ -21,7 +21,9 @@ pub enum EdgeStyle {
     /// Right-angle paths following the dummy columns.
     #[default]
     Orthogonal,
-    /// Straight segments through the dummy columns.
+    /// Use a direct anchor-to-anchor polyline for each safe edge. Edges whose
+    /// direct chain would enter a node use orthogonal channel lanes; safe edges
+    /// in the same component remain straight.
     Straight,
 }
 
@@ -42,17 +44,13 @@ impl EdgeRouter for OrthogonalRouter {
 impl EdgeRouter for StraightRouter {
     fn route(&self, graph: &LayoutGraph, layers: &[Vec<usize>]) -> HashMap<usize, Vec<Point>> {
         let chains = collect_chains(graph);
-        // A diagonal between otherwise valid anchors can still cut across a
-        // real node. In that case use the channel-aware router for the whole
-        // component, preserving its inter-edge lane deconfliction.
-        if chains
-            .iter()
-            .any(|(_, chain)| !straight_chain_is_safe(graph, chain))
-        {
-            return route_orthogonal(graph, layers);
-        }
-        let mut out = HashMap::default();
-        for (orig, chain) in chains {
+        let (safe, fallback): (Vec<_>, Vec<_>) = chains
+            .into_iter()
+            .partition(|(_, chain)| straight_chain_is_safe(graph, chain));
+        // All fallback chains are assigned together, so they share the same
+        // channel occupancy/lane deconfliction as an orthogonal component.
+        let mut out = route_orthogonal_chains(graph, layers, &fallback);
+        for (orig, chain) in safe {
             let points = simplify(chain.anchors);
             if points.len() >= 2 {
                 out.insert(orig, points);
@@ -63,37 +61,29 @@ impl EdgeRouter for StraightRouter {
 }
 
 fn straight_chain_is_safe(graph: &LayoutGraph, chain: &Chain) -> bool {
-    let (Some(&start), Some(&end)) = (chain.anchors.first(), chain.anchors.last()) else {
-        return false;
-    };
-    for node in graph.nodes().filter(|node| !node.is_dummy) {
-        let contains = |p: Point| {
-            p.x >= node.x - node.width / 2.0 - EPS
-                && p.x <= node.x + node.width / 2.0 + EPS
-                && p.y >= node.y - node.height / 2.0 - EPS
-                && p.y <= node.y + node.height / 2.0 + EPS
-        };
-        if contains(start) || contains(end) {
-            continue;
-        }
-        let xmin = node.x - node.width / 2.0;
-        let xmax = node.x + node.width / 2.0;
-        let ymin = node.y - node.height / 2.0;
-        let ymax = node.y + node.height / 2.0;
-        if chain.anchors.windows(2).any(|pair| {
-            let (x0, x1) = (pair[0].x.min(pair[1].x), pair[0].x.max(pair[1].x));
-            let (y0, y1) = (pair[0].y.min(pair[1].y), pair[0].y.max(pair[1].y));
-            x1 > xmin + EPS && x0 < xmax - EPS && y1 > ymin + EPS && y0 < ymax - EPS
-        }) {
-            return false;
-        }
-    }
-    true
+    // There is deliberately no whole-route endpoint exemption: a valid first
+    // or last anchor merely touches a face, while any segment (including the
+    // first/final one) entering an endpoint's strict interior is unsafe.
+    chain.anchors.windows(2).all(|pair| {
+        graph.nodes().filter(|node| !node.is_dummy).all(|node| {
+            !crate::triskel::geometry::segment_enters_rect_strict(
+                pair[0],
+                pair[1],
+                Point {
+                    x: node.x,
+                    y: node.y,
+                },
+                node.width,
+                node.height,
+            )
+        })
+    })
 }
 
 /// The source → target anchor chain of one original edge, plus per-anchor rank
 /// (so each horizontal jog can be attributed to the inter-rank channel it lives
 /// in).
+#[derive(Clone)]
 struct Chain {
     anchors: Vec<Point>,
     ranks: Vec<usize>,
@@ -150,6 +140,17 @@ fn collect_chains(graph: &LayoutGraph) -> Vec<(usize, Chain)> {
 /// x-overlap collapses to the single channel midpoint.
 fn route_orthogonal(graph: &LayoutGraph, layers: &[Vec<usize>]) -> HashMap<usize, Vec<Point>> {
     let chains = collect_chains(graph);
+    route_orthogonal_chains(graph, layers, &chains)
+}
+
+/// Routes one selected set of chains while allocating all of their jog lanes
+/// together. This is used by `Straight` fallback as well as fully orthogonal
+/// routing; routing fallback edges one-by-one would permit collinear overlap.
+fn route_orthogonal_chains(
+    graph: &LayoutGraph,
+    layers: &[Vec<usize>],
+    chains: &[(usize, Chain)],
+) -> HashMap<usize, Vec<Point>> {
     let bands = channel_bands(graph, layers);
 
     // A horizontal jog: the anchor index `idx` within edge `orig`, the channel
@@ -161,23 +162,27 @@ fn route_orthogonal(graph: &LayoutGraph, layers: &[Vec<usize>]) -> HashMap<usize
         x1: f64,
     }
     let mut by_channel: HashMap<usize, Vec<Jog>> = HashMap::default();
-    for (orig, chain) in &chains {
+    for (orig, chain) in chains {
         for (idx, pair) in chain.anchors.windows(2).enumerate() {
             let (a, b) = (pair[0], pair[1]);
             if (a.x - b.x).abs() < EPS {
                 continue; // vertical: no horizontal component
             }
-            // Lanes are only meaningful for adjacent-rank jogs; a (vertical)
-            // long-edge segment spanning several ranks is excluded above.
-            if chain.ranks[idx + 1] != chain.ranks[idx] + 1 {
+            // Lanes are only meaningful for adjacent-rank jogs; this includes
+            // the upward attachment of a back-edge gadget. A (vertical)
+            // multi-rank segment is excluded above.
+            if chain.ranks[idx].abs_diff(chain.ranks[idx + 1]) != 1 {
                 continue;
             }
-            by_channel.entry(chain.ranks[idx]).or_default().push(Jog {
-                orig: *orig,
-                idx,
-                x0: a.x.min(b.x),
-                x1: a.x.max(b.x),
-            });
+            by_channel
+                .entry(chain.ranks[idx].min(chain.ranks[idx + 1]))
+                .or_default()
+                .push(Jog {
+                    orig: *orig,
+                    idx,
+                    x0: a.x.min(b.x),
+                    x1: a.x.max(b.x),
+                });
         }
     }
 
@@ -228,7 +233,7 @@ fn route_orthogonal(graph: &LayoutGraph, layers: &[Vec<usize>]) -> HashMap<usize
 
     // Stitch each polyline, dropping the horizontal jog onto its lane y.
     let mut out = HashMap::default();
-    for (orig, chain) in &chains {
+    for (orig, chain) in chains {
         let mut points = vec![chain.anchors[0]];
         for (idx, pair) in chain.anchors.windows(2).enumerate() {
             let (a, b) = (pair[0], pair[1]);
@@ -603,4 +608,95 @@ fn simplify(points: Vec<Point>) -> Vec<Point> {
 
 fn points_eq(a: Point, b: Point) -> bool {
     (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::triskel::layout::{EdgeLayoutData, NodeLayoutData};
+
+    fn node(graph: &mut LayoutGraph, rank: i64, x: f64, y: f64, dummy: bool) -> usize {
+        graph.make_node(NodeLayoutData {
+            rank,
+            x,
+            y,
+            width: if dummy { 0.0 } else { 20.0 },
+            height: if dummy { 0.0 } else { 20.0 },
+            is_dummy: dummy,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn straight_falls_back_per_edge_without_converting_safe_chains() {
+        let mut graph = LayoutGraph::default();
+        // orig 0 is a safe diagonal on the right. Orig 1's first diagonal
+        // crosses `blocker`, so only it must receive orthogonal jogs.
+        let safe_a = node(&mut graph, 0, 60.0, 0.0, false);
+        let unsafe_a = node(&mut graph, 0, -40.0, 0.0, false);
+        let blocker = node(&mut graph, 1, 0.0, 50.0, false);
+        let dummy = node(&mut graph, 1, 0.0, 50.0, true);
+        let safe_b = node(&mut graph, 1, 80.0, 50.0, false);
+        let unsafe_b = node(&mut graph, 2, 40.0, 100.0, false);
+        graph.make_edge(
+            safe_a,
+            safe_b,
+            EdgeLayoutData {
+                orig: 0,
+                ..Default::default()
+            },
+        );
+        graph.make_edge(
+            unsafe_a,
+            dummy,
+            EdgeLayoutData {
+                orig: 1,
+                ..Default::default()
+            },
+        );
+        graph.make_edge(
+            dummy,
+            unsafe_b,
+            EdgeLayoutData {
+                orig: 1,
+                ..Default::default()
+            },
+        );
+        let layers = vec![
+            vec![safe_a, unsafe_a],
+            vec![blocker, dummy, safe_b],
+            vec![unsafe_b],
+        ];
+        let result = StraightRouter.route(&graph, &layers);
+        assert_eq!(result[&0].len(), 2, "safe edge stays direct");
+        assert!(result[&1].len() > 2, "unsafe edge alone falls back");
+        assert!(
+            result[&1]
+                .windows(2)
+                .all(|p| { (p[0].x - p[1].x).abs() < EPS || (p[0].y - p[1].y).abs() < EPS })
+        );
+        assert_eq!(result, StraightRouter.route(&graph, &layers));
+    }
+
+    #[test]
+    fn strict_safety_rejects_endpoint_reentry_but_allows_face_attachment() {
+        let mut graph = LayoutGraph::default();
+        let source = node(&mut graph, 0, 0.0, 0.0, false);
+        let target = node(&mut graph, 1, 30.0, 30.0, false);
+        let safe = Chain {
+            anchors: vec![Point { x: 0.0, y: 10.0 }, Point { x: 30.0, y: 20.0 }],
+            ranks: vec![0, 1],
+        };
+        assert!(straight_chain_is_safe(&graph, &safe));
+        let reentry = Chain {
+            anchors: vec![
+                Point { x: 0.0, y: 10.0 },
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 30.0, y: 20.0 },
+            ],
+            ranks: vec![0, 0, 1],
+        };
+        assert!(!straight_chain_is_safe(&graph, &reentry));
+        assert_ne!(source, target);
+    }
 }

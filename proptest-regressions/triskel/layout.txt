@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3a3dda5610d0a1c7f954943a9b7848b8de96255d5e6ddeae831e4f5b272f5404 # shrinks to node_count = 6, edge_pairs = [(5, 8), (0, 1), (1, 6), (5, 0), (3, 8), (5, 8), (5, 5), (8, 5)], dimensions = [(10, 10)], node_gap = 8, layer_gap = 16, sweeps = 1, orthogonal = true
