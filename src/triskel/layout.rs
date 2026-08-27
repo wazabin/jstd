@@ -621,6 +621,7 @@ fn local_bounds<NodeId: Identifier, EdgeId: Identifier>(
 mod tests {
     use super::*;
     use jstd_derive::Identifier;
+    use proptest::prelude::*;
 
     #[derive(Identifier)]
     struct N(usize);
@@ -833,6 +834,61 @@ mod tests {
                      [{ay0:.2},{ay1:.2}] vs [{by0:.2},{by1:.2}]"
                 );
             }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn generated_layouts_are_finite_deterministic_and_orthogonal(
+            node_count in 1usize..=6,
+            edge_pairs in proptest::collection::vec((0usize..12, 0usize..12), 0..16),
+            dimensions in proptest::collection::vec((10u32..=140, 10u32..=80), 1..=6),
+            node_gap in 8u32..=40,
+            layer_gap in 16u32..=80,
+            sweeps in 1usize..=6,
+            orthogonal in any::<bool>(),
+        ) {
+            let mut graph = G::default();
+            let nodes: Vec<_> = (0..node_count).map(|_| graph.make_node(())).collect();
+            for (from, to) in edge_pairs {
+                graph.make_edge(nodes[from % node_count], nodes[to % node_count], ());
+            }
+            let geometry = dimensions.clone();
+            let build = || LayoutBuilder::new(&graph)
+                .root(nodes[0])
+                .node_gap(node_gap as f64)
+                .layer_gap(layer_gap as f64)
+                .max_sweeps(sweeps)
+                .edge_style(if orthogonal { EdgeStyle::Orthogonal } else { EdgeStyle::Straight })
+                .geometry(|id| {
+                    let (width, height) = geometry[usize::from(id) % geometry.len()];
+                    NodeGeometry { width: width as f64, height: height as f64 }
+                })
+                .build()
+                .unwrap();
+            let first = build();
+            let second = build();
+            prop_assert_eq!(signature(&first), signature(&second));
+            prop_assert_eq!(first.nodes.len(), node_count);
+            prop_assert_eq!(first.edges.len(), graph.edges().count());
+            for node in first.nodes.values() {
+                prop_assert!(node.x.is_finite() && node.y.is_finite());
+                prop_assert!(node.width.is_finite() && node.height.is_finite());
+                prop_assert!(node.width > 0.0 && node.height > 0.0);
+            }
+            for points in first.edges.values() {
+                prop_assert!(points.len() >= 2);
+                for pair in points.windows(2) {
+                    prop_assert!(pair[0].x.is_finite() && pair[0].y.is_finite());
+                    prop_assert!(pair[1].x.is_finite() && pair[1].y.is_finite());
+                    prop_assert!((pair[0].x - pair[1].x).abs() > 1e-9 || (pair[0].y - pair[1].y).abs() > 1e-9);
+                    if orthogonal {
+                        prop_assert!((pair[0].x - pair[1].x).abs() < 1e-6 || (pair[0].y - pair[1].y).abs() < 1e-6);
+                    }
+                }
+            }
+            assert_no_node_overlap(&first);
         }
     }
 

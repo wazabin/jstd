@@ -33,6 +33,7 @@ serde.workspace = true
 [dev-dependencies]
 bincode.workspace = true
 criterion.workspace = true
+proptest = "1"
 
 [[bench]]
 name = "stable_arena"
