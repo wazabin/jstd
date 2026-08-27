@@ -550,3 +550,43 @@ fn inner_upper(cells: &Cells, v: usize, r: usize) -> Option<i64> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_constraint_keeps_complete_chain_together_and_clear_of_wide_slot() {
+        // p, the pass-through lane, and q initially disagree. The lane shares
+        // rank 1 with a wide vertex on its left, reproducing the constraint the
+        // router needs before it can safely turn this into a vertical column.
+        let cells = Cells {
+            rank: vec![0, 1, 2, 1],
+            pos: vec![0, 1, 0, 0],
+            width: vec![0.0, 0.0, 0.0, 120.0],
+            is_dummy: vec![true; 4],
+            entity: vec![
+                Entity::Segment,
+                Entity::Segment,
+                Entity::Segment,
+                Entity::Vertex(0),
+            ],
+            layers: vec![vec![0], vec![3, 1], vec![2]],
+            parents: vec![Vec::new(); 4],
+            children: vec![Vec::new(); 4],
+            parent_off: vec![Vec::new(); 4],
+            child_off: vec![Vec::new(); 4],
+            segment_chains: vec![vec![0, 1, 2]],
+        };
+        let mut xs = vec![-85.0, 85.0, 85.0, 0.0];
+        enforce_segment_constraints(&cells, 10.0, &mut xs);
+
+        assert!(xs.iter().all(|x| x.is_finite()));
+        assert_eq!(xs[0], xs[1], "p and lane must share one x");
+        assert_eq!(xs[1], xs[2], "lane and q must share one x");
+        assert!(
+            xs[1] - xs[3] >= 70.0,
+            "segment lane must remain right of the wide rank-1 vertex: {xs:?}"
+        );
+    }
+}
