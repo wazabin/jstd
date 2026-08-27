@@ -779,6 +779,43 @@ mod tests {
         assert_no_edge_through_node(&LayoutResult { nodes, edges });
     }
 
+    /// Rejects every edge intersection with a node that is not an endpoint of
+    /// that edge. Endpoint interiors are checked separately because a route may
+    /// validly begin/end on their boundaries.
+    fn assert_no_edge_through_nonincident_node(
+        result: &LayoutResult<N, E>,
+        endpoints: &HashMap<E, (N, N)>,
+    ) {
+        let eps = 0.5;
+        for (edge_id, points) in &result.edges {
+            let &(source, target) = endpoints.get(edge_id).expect("missing edge endpoint data");
+            for seg in points.windows(2) {
+                let (p, q) = (seg[0], seg[1]);
+                let (xmin, xmax) = (p.x.min(q.x), p.x.max(q.x));
+                let (ymin, ymax) = (p.y.min(q.y), p.y.max(q.y));
+                for node in result.nodes.values() {
+                    if node.id == source || node.id == target {
+                        continue;
+                    }
+                    let nx0 = node.x - node.width / 2.0;
+                    let nx1 = node.x + node.width / 2.0;
+                    let ny0 = node.y - node.height / 2.0;
+                    let ny1 = node.y + node.height / 2.0;
+                    let intersects = xmax > nx0 + eps
+                        && xmin < nx1 - eps
+                        && ymax > ny0 + eps
+                        && ymin < ny1 - eps;
+                    assert!(
+                        !intersects,
+                        "edge {} passes through non-incident node {}",
+                        usize::from(*edge_id),
+                        usize::from(node.id)
+                    );
+                }
+            }
+        }
+    }
+
     /// No two horizontal edge segments (from distinct edges) may share a y while
     /// their x-ranges overlap — that is the overlap the lane assignment removes.
     fn assert_no_horizontal_overlap(result: &LayoutResult<N, E>) {
@@ -851,8 +888,11 @@ mod tests {
         ) {
             let mut graph = G::default();
             let nodes: Vec<_> = (0..node_count).map(|_| graph.make_node(())).collect();
+            let mut endpoints = HashMap::default();
             for (from, to) in edge_pairs {
-                graph.make_edge(nodes[from % node_count], nodes[to % node_count], ());
+                let (from, to) = (nodes[from % node_count], nodes[to % node_count]);
+                let edge = graph.make_edge(from, to, ());
+                endpoints.insert(edge, (from, to));
             }
             let geometry = dimensions.clone();
             let build = || LayoutBuilder::new(&graph)
@@ -889,6 +929,9 @@ mod tests {
                 }
             }
             assert_no_node_overlap(&first);
+            if orthogonal {
+                assert_no_edge_through_nonincident_node(&first, &endpoints);
+            }
         }
     }
 
