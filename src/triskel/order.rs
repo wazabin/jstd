@@ -3,8 +3,8 @@
 //! Long edges live as segments inside *containers* — a contiguous run of
 //! co-travelling segments between two vertices in a rank. p-vertices are
 //! absorbed into the preceding container; q-vertices are extracted back out at
-//! their rank. Crossings are counted treating a whole container as one block, so
-//! the pass is O(vertices + segments) rather than O(total edge length).
+//! their rank. Crossings are counted treating a whole container as one block.
+//! The current active-entry scan is not an end-to-end linear-time guarantee.
 //!
 //! Output: every vertex's `order`, the per-rank materialised-vertex layers, the
 //! per-rank slot sequence (vertices and segment lanes, left to right) used by
@@ -308,15 +308,26 @@ impl<'g> Context<'g> {
         for item in &layer.items {
             match item {
                 Item::Vertex(node) => {
-                    let mut incoming: Vec<usize> = self
-                        .graph
-                        .get_node(*node)
-                        .unwrap()
-                        .parents()
-                        .map(|p| self.graph.get_node(p.node_id()).unwrap().order)
-                        .collect();
-                    incoming.sort_unstable();
-                    for parent_pos in incoming {
+                    // In an upward sweep, `layer` is above the previously
+                    // processed rank, so its relevant neighbours are children,
+                    // not parents.
+                    let mut neighbors: Vec<usize> = if self.reversed {
+                        self.graph
+                            .get_node(*node)
+                            .unwrap()
+                            .children()
+                            .map(|c| self.graph.get_node(c.node_id()).unwrap().order)
+                            .collect()
+                    } else {
+                        self.graph
+                            .get_node(*node)
+                            .unwrap()
+                            .parents()
+                            .map(|p| self.graph.get_node(p.node_id()).unwrap().order)
+                            .collect()
+                    };
+                    neighbors.sort_unstable();
+                    for parent_pos in neighbors {
                         for &(pos, weight) in &active {
                             if pos > parent_pos {
                                 crossings += weight;
@@ -490,4 +501,59 @@ fn flatten(layer: &Layer) -> Vec<Slot> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::triskel::layout::{EdgeLayoutData, NodeLayoutData};
+
+    fn context(graph: &mut LayoutGraph, reversed: bool) -> Context<'_> {
+        Context {
+            graph,
+            pvertices: HashSet::default(),
+            qvertices: HashSet::default(),
+            wishes: HashMap::default(),
+            reversed,
+        }
+    }
+
+    #[test]
+    fn crossing_score_uses_sweep_direction() {
+        // a,b (top) → c,d (bottom), with a→d and b→c crossing once.
+        let mut graph = LayoutGraph::default();
+        let a = graph.make_node(NodeLayoutData {
+            rank: 0,
+            order: 0,
+            ..Default::default()
+        });
+        let b = graph.make_node(NodeLayoutData {
+            rank: 0,
+            order: 1,
+            ..Default::default()
+        });
+        let c = graph.make_node(NodeLayoutData {
+            rank: 1,
+            order: 0,
+            ..Default::default()
+        });
+        let d = graph.make_node(NodeLayoutData {
+            rank: 1,
+            order: 1,
+            ..Default::default()
+        });
+        graph.make_edge(a, d, EdgeLayoutData::default());
+        graph.make_edge(b, c, EdgeLayoutData::default());
+
+        let bottom = Layer {
+            items: vec![Item::Vertex(c), Item::Vertex(d)],
+        };
+        assert_eq!(context(&mut graph, false).count_crossings(&bottom), 1);
+
+        // The same geometric crossing viewed upward must score identically.
+        let top = Layer {
+            items: vec![Item::Vertex(a), Item::Vertex(b)],
+        };
+        assert_eq!(context(&mut graph, true).count_crossings(&top), 1);
+    }
 }
