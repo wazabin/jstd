@@ -699,7 +699,7 @@ mod tests {
     fn assert_no_edge_through_node(result: &LayoutResult<N, E>) {
         let eps = 0.5;
         for (edge_id, points) in &result.edges {
-            for seg in points.windows(2) {
+            for (index, seg) in points.windows(2).enumerate() {
                 let (p, q) = (seg[0], seg[1]);
                 let (xmin, xmax) = (p.x.min(q.x), p.x.max(q.x));
                 let (ymin, ymax) = (p.y.min(q.y), p.y.max(q.y));
@@ -710,24 +710,72 @@ mod tests {
                     let ny1 = node.y + node.height / 2.0;
                     let x_inside = xmax > nx0 + eps && xmin < nx1 - eps;
                     let y_inside = ymax > ny0 + eps && ymin < ny1 - eps;
-                    if x_inside && y_inside {
-                        let touches_endpoint = points.first().is_some_and(|e| {
-                            (e.x - node.x).abs() < node.width / 2.0 + eps
-                                && (e.y - node.y).abs() < node.height / 2.0 + eps
-                        }) || points.last().is_some_and(|e| {
-                            (e.x - node.x).abs() < node.width / 2.0 + eps
-                                && (e.y - node.y).abs() < node.height / 2.0 + eps
-                        });
-                        assert!(
-                            touches_endpoint,
-                            "edge {} passes through node {}",
-                            usize::from(*edge_id),
-                            usize::from(node.id)
-                        );
+                    if !x_inside || !y_inside {
+                        continue;
                     }
+                    // Only the incident segment may touch the node at its
+                    // corresponding endpoint. A later segment that re-enters
+                    // either endpoint node is still an illegal intersection.
+                    let on_node = |point: Point| {
+                        point.x >= nx0 - eps
+                            && point.x <= nx1 + eps
+                            && point.y >= ny0 - eps
+                            && point.y <= ny1 + eps
+                    };
+                    let allowed =
+                        (index == 0 && on_node(p)) || (index + 2 == points.len() && on_node(q));
+                    assert!(
+                        allowed,
+                        "edge {} segment {index} passes through node {}",
+                        usize::from(*edge_id),
+                        usize::from(node.id)
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "segment 1 passes through node 0")]
+    fn edge_checker_rejects_later_reentry_into_endpoint_node() {
+        let source = N::from(0);
+        let target = N::from(1);
+        let edge = E::from(0);
+        let mut nodes = HashMap::default();
+        nodes.insert(
+            source,
+            LayoutNode {
+                id: source,
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        );
+        nodes.insert(
+            target,
+            LayoutNode {
+                id: target,
+                x: 20.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        );
+        let mut edges = HashMap::default();
+        // The first point validly touches source's bottom boundary. Segment 1
+        // then re-enters its interior, which the former whole-polyline
+        // endpoint exemption incorrectly accepted.
+        edges.insert(
+            edge,
+            vec![
+                Point { x: 0.0, y: 5.0 },
+                Point { x: 0.0, y: 10.0 },
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 20.0, y: 0.0 },
+            ],
+        );
+        assert_no_edge_through_node(&LayoutResult { nodes, edges });
     }
 
     /// No two horizontal edge segments (from distinct edges) may share a y while
@@ -754,6 +802,35 @@ mod tests {
                     !overlap,
                     "edges {ea} and {eb} have overlapping horizontal segments at y={ya:.2}: \
                      [{ax0:.2},{ax1:.2}] vs [{bx0:.2},{bx1:.2}]"
+                );
+            }
+        }
+    }
+
+    /// No two vertical edge segments (from distinct edges) may share an x while
+    /// their y-ranges overlap. This is the vertical counterpart of the channel
+    /// lane check above and catches accidentally bundled dummy columns.
+    fn assert_no_vertical_overlap(result: &LayoutResult<N, E>) {
+        let eps = 1e-6;
+        let mut vsegs: Vec<(usize, f64, f64, f64)> = Vec::new();
+        for (edge_id, points) in &result.edges {
+            for seg in points.windows(2) {
+                let (p, q) = (seg[0], seg[1]);
+                if (p.x - q.x).abs() < eps && (p.y - q.y).abs() > eps {
+                    vsegs.push((usize::from(*edge_id), p.x, p.y.min(q.y), p.y.max(q.y)));
+                }
+            }
+        }
+        for (i, &(ea, xa, ay0, ay1)) in vsegs.iter().enumerate() {
+            for &(eb, xb, by0, by1) in vsegs.iter().skip(i + 1) {
+                if ea == eb || (xa - xb).abs() > eps {
+                    continue;
+                }
+                let overlap = ay0.max(by0) + eps < ay1.min(by1);
+                assert!(
+                    !overlap,
+                    "edges {ea} and {eb} have overlapping vertical segments at x={xa:.2}: \
+                     [{ay0:.2},{ay1:.2}] vs [{by0:.2},{by1:.2}]"
                 );
             }
         }
@@ -806,6 +883,7 @@ mod tests {
             }
         }
         assert_no_horizontal_overlap(&r);
+        assert_no_vertical_overlap(&r);
     }
 
     #[test]
