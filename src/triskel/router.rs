@@ -636,8 +636,11 @@ mod tests {
         let unsafe_a = node(&mut graph, 0, -40.0, 0.0, false);
         let blocker = node(&mut graph, 1, 0.0, 50.0, false);
         let dummy = node(&mut graph, 1, 0.0, 50.0, true);
+        let dummy_two = node(&mut graph, 1, 0.0, 50.0, true);
         let safe_b = node(&mut graph, 1, 80.0, 50.0, false);
         let unsafe_b = node(&mut graph, 2, 40.0, 100.0, false);
+        let unsafe_c = node(&mut graph, 0, -60.0, 0.0, false);
+        let unsafe_d = node(&mut graph, 2, 45.0, 100.0, false);
         graph.make_edge(
             safe_a,
             safe_b,
@@ -662,10 +665,26 @@ mod tests {
                 ..Default::default()
             },
         );
+        graph.make_edge(
+            unsafe_c,
+            dummy_two,
+            EdgeLayoutData {
+                orig: 2,
+                ..Default::default()
+            },
+        );
+        graph.make_edge(
+            dummy_two,
+            unsafe_d,
+            EdgeLayoutData {
+                orig: 2,
+                ..Default::default()
+            },
+        );
         let layers = vec![
-            vec![safe_a, unsafe_a],
-            vec![blocker, dummy, safe_b],
-            vec![unsafe_b],
+            vec![safe_a, unsafe_a, unsafe_c],
+            vec![blocker, dummy, dummy_two, safe_b],
+            vec![unsafe_b, unsafe_d],
         ];
         let result = StraightRouter.route(&graph, &layers);
         assert_eq!(result[&0].len(), 2, "safe edge stays direct");
@@ -674,6 +693,16 @@ mod tests {
             result[&1]
                 .windows(2)
                 .all(|p| { (p[0].x - p[1].x).abs() < EPS || (p[0].y - p[1].y).abs() < EPS })
+        );
+        let horizontal_y = |points: &[Point]| {
+            points.windows(2).find_map(|p| {
+                ((p[0].y - p[1].y).abs() < EPS && (p[0].x - p[1].x).abs() > EPS).then_some(p[0].y)
+            })
+        };
+        assert_ne!(
+            horizontal_y(&result[&1]),
+            horizontal_y(&result[&2]),
+            "overlapping fallback jogs need distinct lanes"
         );
         assert_eq!(result, StraightRouter.route(&graph, &layers));
     }
