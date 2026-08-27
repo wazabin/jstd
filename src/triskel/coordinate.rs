@@ -87,8 +87,32 @@ pub(crate) fn assign_x(
     }
 
     let mut xs: Vec<f64> = sum.into_iter().map(|x| x / 4.0).collect();
-    enforce_segment_constraints(&cells, node_gap, &mut xs);
-    align_gadget_endpoints(graph, &cells, node_gap, &mut xs);
+    assert!(enforce_coordinate_constraints(
+        &cells,
+        &[],
+        node_gap,
+        &mut xs
+    ));
+
+    // Gadget endpoint alignment is desirable but not always compatible with
+    // the established slot order. Add each equality only when the complete
+    // equality/separation system remains feasible; otherwise the router keeps
+    // the endpoint jog rather than violating rank order.
+    let mut gadget_equalities = Vec::new();
+    for equality in gadget_endpoint_equalities(graph, &cells) {
+        let mut candidate_equalities = gadget_equalities.clone();
+        candidate_equalities.push(equality);
+        let mut candidate_xs = xs.clone();
+        if enforce_coordinate_constraints(
+            &cells,
+            &candidate_equalities,
+            node_gap,
+            &mut candidate_xs,
+        ) {
+            gadget_equalities = candidate_equalities;
+            xs = candidate_xs;
+        }
+    }
 
     for (cid, entity) in cells.entity.iter().enumerate() {
         if let Entity::Vertex(id) = entity {
@@ -225,7 +249,12 @@ fn build_cells(graph: &LayoutGraph, seg: &SegmentInfo, ordering: &Ordering) -> C
 /// per-rank separation inequality. Brandes–Köpf alignment is deliberately not
 /// used for this: conflict marking may reject an alignment even though segment
 /// continuity is a representation invariant.
-fn enforce_segment_constraints(cells: &Cells, node_gap: f64, xs: &mut [f64]) {
+fn enforce_coordinate_constraints(
+    cells: &Cells,
+    extra_equalities: &[(usize, usize)],
+    node_gap: f64,
+    xs: &mut [f64],
+) -> bool {
     fn find(parent: &mut [usize], x: usize) -> usize {
         if parent[x] != x {
             parent[x] = find(parent, parent[x]);
@@ -235,12 +264,20 @@ fn enforce_segment_constraints(cells: &Cells, node_gap: f64, xs: &mut [f64]) {
 
     let n = xs.len();
     let mut parent: Vec<usize> = (0..n).collect();
-    for chain in &cells.segment_chains {
-        for pair in chain.windows(2) {
-            let a = find(&mut parent, pair[0]);
-            let b = find(&mut parent, pair[1]);
+    let mut unite = |left: usize, right: usize| {
+        let a = find(&mut parent, left);
+        let b = find(&mut parent, right);
+        if a != b {
             parent[b] = a;
         }
+    };
+    for chain in &cells.segment_chains {
+        for pair in chain.windows(2) {
+            unite(pair[0], pair[1]);
+        }
+    }
+    for &(left, right) in extra_equalities {
+        unite(left, right);
     }
     let groups: Vec<usize> = (0..n).map(|i| find(&mut parent, i)).collect();
 
@@ -282,26 +319,26 @@ fn enforce_segment_constraints(cells: &Cells, node_gap: f64, xs: &mut [f64]) {
             break;
         }
     }
-    debug_assert!(
-        cells
-            .layers
-            .iter()
-            .all(|layer| layer.windows(2).all(|pair| {
-                let sep = (cells.width[pair[0]] + cells.width[pair[1]]) / 2.0 + node_gap;
-                value[groups[pair[1]]] + 1e-9 >= value[groups[pair[0]]] + sep
-            })),
-        "incompatible segment/order constraints"
-    );
+    let feasible = cells.layers.iter().all(|layer| {
+        layer.windows(2).all(|pair| {
+            let sep = (cells.width[pair[0]] + cells.width[pair[1]]) / 2.0 + node_gap;
+            value[groups[pair[1]]] + 1e-9 >= value[groups[pair[0]]] + sep
+        })
+    });
+    if !feasible {
+        return false;
+    }
 
     for (i, &g) in groups.iter().enumerate() {
         xs[i] = value[g];
     }
+    true
 }
 
-/// Align back-edge gadget endpoints while slot cells still exist. Each snap is
-/// followed by full segment equality and rank-separation restoration, so this
-/// is a coordinate constraint operation rather than a post-compaction mutation.
-fn align_gadget_endpoints(graph: &LayoutGraph, cells: &Cells, node_gap: f64, xs: &mut [f64]) {
+/// Candidate hard endpoint/column equalities for back-edge gadgets. The caller
+/// admits them into the unified solver only when they are compatible with slot
+/// order; a rejected equality remains an ordinary routed endpoint jog.
+fn gadget_endpoint_equalities(graph: &LayoutGraph, cells: &Cells) -> Vec<(usize, usize)> {
     let vertex_cells: HashMap<usize, usize> = cells
         .entity
         .iter()
@@ -312,48 +349,48 @@ fn align_gadget_endpoints(graph: &LayoutGraph, cells: &Cells, node_gap: f64, xs:
         })
         .collect();
     let is_dummy = |id: usize| graph.get_node(id).unwrap().is_dummy;
-    let mut ids: Vec<usize> = graph
+    let mut ids: Vec<_> = graph
         .nodes()
         .filter(|node| node.is_dummy)
         .map(|node| node.id())
         .collect();
     ids.sort_unstable();
-
+    let mut result = Vec::new();
     for id in ids {
         let node = graph.get_node(id).unwrap();
-        let column_child = node
+        let child = node
             .children()
-            .find(|child| {
-                graph.get_edge(child.edge_id()).unwrap().reversed && is_dummy(child.node_id())
+            .find(|edge| {
+                graph.get_edge(edge.edge_id()).unwrap().reversed && is_dummy(edge.node_id())
             })
-            .map(|child| child.node_id());
-        let real_child = node.children().any(|child| {
-            graph.get_edge(child.edge_id()).unwrap().reversed && !is_dummy(child.node_id())
+            .map(|edge| edge.node_id());
+        let has_real_child = node.children().any(|edge| {
+            graph.get_edge(edge.edge_id()).unwrap().reversed && !is_dummy(edge.node_id())
         });
-        let column_parent = node
+        let parent = node
             .parents()
-            .find(|parent| {
-                graph.get_edge(parent.edge_id()).unwrap().reversed && is_dummy(parent.node_id())
+            .find(|edge| {
+                graph.get_edge(edge.edge_id()).unwrap().reversed && is_dummy(edge.node_id())
             })
-            .map(|parent| parent.node_id());
-        let real_parent = node.parents().any(|parent| {
-            graph.get_edge(parent.edge_id()).unwrap().reversed && !is_dummy(parent.node_id())
+            .map(|edge| edge.node_id());
+        let has_real_parent = node.parents().any(|edge| {
+            graph.get_edge(edge.edge_id()).unwrap().reversed && !is_dummy(edge.node_id())
         });
-        let column = if real_child {
-            column_child
-        } else if real_parent {
-            column_parent
+        let column = if has_real_child {
+            child
+        } else if has_real_parent {
+            parent
         } else {
             None
         };
         if let Some(column) = column
-            && let (Some(&endpoint_cell), Some(&column_cell)) =
+            && let (Some(&endpoint), Some(&column)) =
                 (vertex_cells.get(&id), vertex_cells.get(&column))
         {
-            xs[endpoint_cell] = xs[column_cell];
-            enforce_segment_constraints(cells, node_gap, xs);
+            result.push((endpoint, column));
         }
     }
+    result
 }
 
 fn directional_pass(
@@ -638,7 +675,7 @@ mod tests {
             segment_chains: vec![vec![0, 1, 2]],
         };
         let mut xs = vec![-85.0, 85.0, 85.0, 0.0];
-        enforce_segment_constraints(&cells, 10.0, &mut xs);
+        assert!(enforce_coordinate_constraints(&cells, &[], 10.0, &mut xs));
 
         assert!(xs.iter().all(|x| x.is_finite()));
         assert_eq!(xs[0], xs[1], "p and lane must share one x");
