@@ -49,7 +49,7 @@ impl Item {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Layer {
     items: Vec<Item>,
 }
@@ -139,8 +139,9 @@ impl<'g> Context<'g> {
             self.compute_wishes(child);
             layer = self.merge(layer, child);
             self.extract_q(&mut layer, child);
-            crossings += self.count_crossings(&layer);
             layer.normalize();
+            self.transpose(&mut layer);
+            crossings += self.count_crossings(&layer);
         }
         self.assign_container_positions(&mut layer);
         crossings
@@ -295,6 +296,47 @@ impl<'g> Context<'g> {
             layer
                 .items
                 .insert(idx + 2, Item::Container(right, spos + left_size + 1));
+        }
+    }
+
+    /// Local adjacent-swap refinement. Empty containers are structural
+    /// separators, not ordering elements, so candidate swaps operate on the
+    /// adjacent vertices/non-empty containers visible through them. Every
+    /// candidate is re-normalised and accepted only when it strictly improves
+    /// the same crossing objective used by the sweep.
+    fn transpose(&mut self, layer: &mut Layer) {
+        loop {
+            self.assign_container_positions(layer);
+            let current = self.count_crossings(layer);
+            let content: Vec<usize> = layer
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| match item {
+                    Item::Vertex(_) => Some(index),
+                    Item::Container(segments, _) if !segments.is_empty() => Some(index),
+                    Item::Container(_, _) => None,
+                })
+                .collect();
+            let mut accepted = None;
+            for pair in content.windows(2) {
+                let mut candidate = layer.clone();
+                candidate.items.swap(pair[0], pair[1]);
+                candidate.normalize();
+                self.assign_container_positions(&mut candidate);
+                let score = self.count_crossings(&candidate);
+                if score < current {
+                    accepted = Some(candidate);
+                    break;
+                }
+            }
+            if let Some(candidate) = accepted {
+                *layer = candidate;
+            } else {
+                // A rejected candidate temporarily rewrote current-rank orders.
+                self.assign_container_positions(layer);
+                break;
+            }
         }
     }
 
@@ -602,6 +644,55 @@ mod tests {
             items: vec![Item::Vertex(a), Item::Vertex(b)],
         };
         assert_eq!(context(&mut graph, true).count_crossings(&top), 1);
+    }
+
+    #[test]
+    fn transpose_strictly_improves_an_adjacent_crossing() {
+        let mut graph = LayoutGraph::default();
+        let a = graph.make_node(NodeLayoutData {
+            rank: 0,
+            order: 0,
+            ..Default::default()
+        });
+        let b = graph.make_node(NodeLayoutData {
+            rank: 0,
+            order: 1,
+            ..Default::default()
+        });
+        let c = graph.make_node(NodeLayoutData {
+            rank: 1,
+            order: 0,
+            ..Default::default()
+        });
+        let d = graph.make_node(NodeLayoutData {
+            rank: 1,
+            order: 1,
+            ..Default::default()
+        });
+        graph.make_edge(a, d, EdgeLayoutData::default());
+        graph.make_edge(b, c, EdgeLayoutData::default());
+        let mut layer = Layer {
+            items: vec![
+                Item::Container(Vec::new(), 0),
+                Item::Vertex(c),
+                Item::Container(Vec::new(), 0),
+                Item::Vertex(d),
+                Item::Container(Vec::new(), 0),
+            ],
+        };
+        let mut ctx = context(&mut graph, false);
+        assert_eq!(ctx.count_crossings(&layer), 1);
+        ctx.transpose(&mut layer);
+        assert_eq!(ctx.count_crossings(&layer), 0);
+        let vertices: Vec<_> = layer
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Vertex(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vertices, vec![d, c]);
     }
 
     #[test]
