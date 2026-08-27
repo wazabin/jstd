@@ -387,8 +387,52 @@ pub(crate) fn order(
     // Rebuild deterministic top-down layers + slots from the final orders.
     let layers = build_layers(graph, max_rank);
     let slots = build_slots(graph, seg, &layers);
+    debug_assert_slot_contract(graph, seg, &layers, &slots);
 
     Ordering { layers, slots }
+}
+
+/// Phase boundary contract: materialised vertices occur once at their own rank;
+/// each p/q segment occupies exactly its intermediate ranks and nowhere else.
+fn debug_assert_slot_contract(
+    graph: &LayoutGraph,
+    seg: &SegmentInfo,
+    layers: &[Vec<usize>],
+    slots: &[Vec<Slot>],
+) {
+    debug_assert_eq!(layers.len(), slots.len());
+    let mut vertices = HashSet::default();
+    let mut lanes: HashMap<usize, Vec<usize>> = HashMap::default();
+    for (rank, row) in slots.iter().enumerate() {
+        for slot in row {
+            match *slot {
+                Slot::Vertex(id) => {
+                    debug_assert_eq!(layer_of(graph, id), rank);
+                    debug_assert!(vertices.insert(id), "vertex {id} appears in multiple slots");
+                }
+                Slot::Segment(q) => lanes.entry(q).or_default().push(rank),
+            }
+        }
+    }
+    let expected_vertices: HashSet<usize> = graph.nodes().map(|node| node.id()).collect();
+    debug_assert_eq!(vertices, expected_vertices, "slot vertex set is incomplete");
+
+    for &q in &seg.qvertices {
+        let p = graph
+            .get_node(q)
+            .unwrap()
+            .parents()
+            .next()
+            .unwrap()
+            .node_id();
+        let expected: Vec<usize> = ((layer_of(graph, p) + 1)..layer_of(graph, q)).collect();
+        debug_assert_eq!(
+            lanes.remove(&q).unwrap_or_default(),
+            expected,
+            "invalid lane interval for q={q}"
+        );
+    }
+    debug_assert!(lanes.is_empty(), "slot contains an unknown segment");
 }
 
 /// Seed each rank's order from a DFS preorder so crossing reduction starts from
@@ -506,7 +550,10 @@ fn flatten(layer: &Layer) -> Vec<Slot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triskel::layout::{EdgeLayoutData, NodeLayoutData};
+    use crate::triskel::{
+        layout::{EdgeLayoutData, NodeLayoutData},
+        rank, segment,
+    };
 
     fn context(graph: &mut LayoutGraph, reversed: bool) -> Context<'_> {
         Context {
@@ -555,5 +602,34 @@ mod tests {
             items: vec![Item::Vertex(a), Item::Vertex(b)],
         };
         assert_eq!(context(&mut graph, true).count_crossings(&top), 1);
+    }
+
+    #[test]
+    fn slots_contain_each_vertex_and_each_active_segment_lane_once() {
+        let mut graph = LayoutGraph::default();
+        let nodes: Vec<_> = (0..5)
+            .map(|_| graph.make_node(NodeLayoutData::default()))
+            .collect();
+        for pair in nodes.windows(2) {
+            graph.make_edge(pair[0], pair[1], EdgeLayoutData::default());
+        }
+        graph.make_edge(nodes[0], nodes[4], EdgeLayoutData::default());
+        rank::assign_ranks(&mut graph);
+        let segments = segment::build_segments(&mut graph);
+        let ordering = order(&mut graph, &segments, nodes[0], 4);
+
+        debug_assert_slot_contract(&graph, &segments, &ordering.layers, &ordering.slots);
+        let q = *segments.qvertices.iter().next().unwrap();
+        let lane_ranks: Vec<_> = ordering
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, row)| {
+                row.iter()
+                    .any(|slot| matches!(slot, Slot::Segment(id) if *id == q))
+                    .then_some(rank)
+            })
+            .collect();
+        assert_eq!(lane_ranks, vec![2]);
     }
 }
