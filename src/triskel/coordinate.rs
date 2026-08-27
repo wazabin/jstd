@@ -88,6 +88,7 @@ pub(crate) fn assign_x(
 
     let mut xs: Vec<f64> = sum.into_iter().map(|x| x / 4.0).collect();
     enforce_segment_constraints(&cells, node_gap, &mut xs);
+    align_gadget_endpoints(graph, &cells, node_gap, &mut xs);
 
     for (cid, entity) in cells.entity.iter().enumerate() {
         if let Entity::Vertex(id) = entity {
@@ -294,6 +295,64 @@ fn enforce_segment_constraints(cells: &Cells, node_gap: f64, xs: &mut [f64]) {
 
     for (i, &g) in groups.iter().enumerate() {
         xs[i] = value[g];
+    }
+}
+
+/// Align back-edge gadget endpoints while slot cells still exist. Each snap is
+/// followed by full segment equality and rank-separation restoration, so this
+/// is a coordinate constraint operation rather than a post-compaction mutation.
+fn align_gadget_endpoints(graph: &LayoutGraph, cells: &Cells, node_gap: f64, xs: &mut [f64]) {
+    let vertex_cells: HashMap<usize, usize> = cells
+        .entity
+        .iter()
+        .enumerate()
+        .filter_map(|(cell, entity)| match entity {
+            Entity::Vertex(id) => Some((*id, cell)),
+            Entity::Segment => None,
+        })
+        .collect();
+    let is_dummy = |id: usize| graph.get_node(id).unwrap().is_dummy;
+    let mut ids: Vec<usize> = graph
+        .nodes()
+        .filter(|node| node.is_dummy)
+        .map(|node| node.id())
+        .collect();
+    ids.sort_unstable();
+
+    for id in ids {
+        let node = graph.get_node(id).unwrap();
+        let column_child = node
+            .children()
+            .find(|child| {
+                graph.get_edge(child.edge_id()).unwrap().reversed && is_dummy(child.node_id())
+            })
+            .map(|child| child.node_id());
+        let real_child = node.children().any(|child| {
+            graph.get_edge(child.edge_id()).unwrap().reversed && !is_dummy(child.node_id())
+        });
+        let column_parent = node
+            .parents()
+            .find(|parent| {
+                graph.get_edge(parent.edge_id()).unwrap().reversed && is_dummy(parent.node_id())
+            })
+            .map(|parent| parent.node_id());
+        let real_parent = node.parents().any(|parent| {
+            graph.get_edge(parent.edge_id()).unwrap().reversed && !is_dummy(parent.node_id())
+        });
+        let column = if real_child {
+            column_child
+        } else if real_parent {
+            column_parent
+        } else {
+            None
+        };
+        if let Some(column) = column
+            && let (Some(&endpoint_cell), Some(&column_cell)) =
+                (vertex_cells.get(&id), vertex_cells.get(&column))
+        {
+            xs[endpoint_cell] = xs[column_cell];
+            enforce_segment_constraints(cells, node_gap, xs);
+        }
     }
 }
 

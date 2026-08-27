@@ -450,7 +450,6 @@ where
     let seg = segment::build_segments(&mut local);
     let ordering = order::order(&mut local, &seg, root_local, settings.max_sweeps);
     coordinate::assign_x(&mut local, &seg, &ordering, settings.node_gap);
-    align_gadget_endpoints(&mut local);
     assign_y(&mut local, &ordering.layers, settings.layer_gap);
 
     let waypoints = match settings.edge_style {
@@ -492,54 +491,6 @@ where
     }
 
     ComponentLayout { nodes, edges }
-}
-
-/// Snaps each back-edge gadget's virtual endpoints (`A'`, `B'`) onto their wrap
-/// column after x-assignment. Brandes–Köpf places `A'`/`B'` by averaging the pull
-/// of their real attach node and their column dummy, leaving them mid-way and
-/// kinking the column; aligning them to the column dummy makes the column one
-/// straight vertical and each attach edge a single jog. They are virtual (not
-/// rendered), so only the routed polyline is affected.
-fn align_gadget_endpoints(graph: &mut LayoutGraph) {
-    let is_dummy = |g: &LayoutGraph, id: usize| g.get_node(id).unwrap().is_dummy;
-    let ids: Vec<usize> = graph
-        .nodes()
-        .filter(|n| n.is_dummy)
-        .map(|n| n.id())
-        .collect();
-
-    for id in ids {
-        let node = graph.get_node(id).unwrap();
-        // A back-edge gadget endpoint joins a real node and a column dummy via
-        // `reversed` edges. A' has them as children (out), B' as parents (in).
-        // Snap onto the column-dummy side.
-        let column_child = node
-            .children()
-            .find(|c| graph.get_edge(c.edge_id()).unwrap().reversed && is_dummy(graph, c.node_id()))
-            .map(|c| c.node_id());
-        let real_child = node.children().any(|c| {
-            graph.get_edge(c.edge_id()).unwrap().reversed && !is_dummy(graph, c.node_id())
-        });
-        let column_parent = node
-            .parents()
-            .find(|p| graph.get_edge(p.edge_id()).unwrap().reversed && is_dummy(graph, p.node_id()))
-            .map(|p| p.node_id());
-        let real_parent = node.parents().any(|p| {
-            graph.get_edge(p.edge_id()).unwrap().reversed && !is_dummy(graph, p.node_id())
-        });
-
-        let column = if real_child {
-            column_child // A'
-        } else if real_parent {
-            column_parent // B'
-        } else {
-            None
-        };
-        if let Some(col) = column {
-            let x = graph.get_node(col).unwrap().x;
-            graph.get_node_mut(id).unwrap().x = x;
-        }
-    }
 }
 
 /// Assigns each node a y by rank, using the tallest node in each rank so bends
