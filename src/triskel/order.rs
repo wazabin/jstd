@@ -719,14 +719,10 @@ mod tests {
                         graph.get_node_mut(bottom[index]).unwrap().order = position;
                     }
                     let mut edges = Vec::new();
-                    for source in 0..2 {
-                        for target in 0..2 {
+                    for (source, &source_id) in top.iter().enumerate() {
+                        for (target, &target_id) in bottom.iter().enumerate() {
                             if mask & (1 << (source * 2 + target)) != 0 {
-                                graph.make_edge(
-                                    top[source],
-                                    bottom[target],
-                                    EdgeLayoutData::default(),
-                                );
+                                graph.make_edge(source_id, target_id, EdgeLayoutData::default());
                                 edges.push((source, target));
                             }
                         }
