@@ -1184,6 +1184,35 @@ mod tests {
     }
 
     #[test]
+    fn segment_chain_preserves_order_beside_wide_node_regression() {
+        // Regression for a p/q segment whose endpoints were assigned different
+        // x coordinates, making the router bridge through node 3.
+        let mut g = G::default();
+        let n: Vec<_> = (0..4).map(|_| g.make_node(())).collect();
+        g.make_edge(n[0], n[2], ());
+        g.make_edge(n[1], n[0], ());
+        let edge = g.make_edge(n[1], n[2], ());
+        g.make_edge(n[2], n[0], ());
+        g.make_edge(n[2], n[3], ());
+        g.make_edge(n[3], n[1], ());
+        let r = LayoutBuilder::new(&g)
+            .root(n[0])
+            .geometry(|id| NodeGeometry {
+                width: if usize::from(id) % 3 == 0 {
+                    120.0
+                } else {
+                    40.0
+                },
+                height: 30.0,
+            })
+            .build()
+            .unwrap();
+        assert!(r.get_waypoints(edge).unwrap().len() >= 2);
+        assert_no_edge_through_node(&r);
+        assert_no_node_overlap(&r);
+    }
+
+    #[test]
     fn long_edge_segment_avoids_wide_intermediate_node() {
         // Chain a..e over 5 ranks plus a long edge a->e spanning all of them.
         // Its q-vertex/segment passes through rank 2 where `c` is very wide; the

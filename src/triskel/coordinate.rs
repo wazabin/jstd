@@ -8,7 +8,9 @@
 //! Brandes–Köpf alignment passes (up/down × left/right), averaging the results.
 //! Each pass keeps the separation `x[right] − x[left] ≥ (w_l+w_r)/2 + node_gap`
 //! for adjacent slots, so the average is collision-free at any node width, and a
-//! segment's p/lanes/q share one x (a straight vertical run).
+//! segment's p/lanes/q share one x (a straight vertical run). This is enforced
+//! as a hard equality constraint after the four directional passes; it is not
+//! left to the optional Brandes–Köpf alignment heuristic.
 //!
 //! **Edge-offset drift.** Edges don't attach at node centres — the router fans
 //! a node's edges across its bottom/top face, so an edge leaves its source at
@@ -22,9 +24,9 @@
 //! router's [`assign_ports`], which is deterministic in node width + order and
 //! therefore matches the offsets the router applies afterwards.
 //!
-//! Cells are transient arrays freed after this phase; the graph itself stays at
-//! O(1) objects per long edge, and the crossing-reduction pass remains
-//! O(vertices + segments).
+//! Cells are transient arrays freed after this phase. The graph itself stays at
+//! O(1) objects per long edge, while these per-rank cells necessarily use memory
+//! proportional to the total active segment span.
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -57,6 +59,9 @@ struct Cells {
     /// carry the router's fan-out offset; dummy ends are 0 (centred).
     parent_off: Vec<Vec<(f64, f64)>>,
     child_off: Vec<Vec<(f64, f64)>>,
+    /// Complete p → lanes → q chains. These are coordinate constraints, not
+    /// optional alignment candidates.
+    segment_chains: Vec<Vec<usize>>,
 }
 
 pub(crate) fn assign_x(
@@ -81,9 +86,12 @@ pub(crate) fn assign_x(
         }
     }
 
+    let mut xs: Vec<f64> = sum.into_iter().map(|x| x / 4.0).collect();
+    enforce_segment_constraints(&cells, node_gap, &mut xs);
+
     for (cid, entity) in cells.entity.iter().enumerate() {
         if let Entity::Vertex(id) = entity {
-            graph.get_node_mut(*id).unwrap().x = sum[cid] / 4.0;
+            graph.get_node_mut(*id).unwrap().x = xs[cid];
         }
     }
 }
@@ -173,6 +181,7 @@ fn build_cells(graph: &LayoutGraph, seg: &SegmentInfo, ordering: &Ordering) -> C
 
     // Rule 2: each segment's straight run p → lanes → q. All internal links join
     // dummy ends, so they carry no offset (centred).
+    let mut segment_chains = Vec::new();
     let mut qids: Vec<usize> = seg.qvertices.iter().copied().collect();
     qids.sort_unstable();
     for q in qids {
@@ -193,6 +202,7 @@ fn build_cells(graph: &LayoutGraph, seg: &SegmentInfo, ordering: &Ordering) -> C
         for pair in chain.windows(2) {
             link(pair[0], pair[1], (0.0, 0.0));
         }
+        segment_chains.push(chain);
     }
 
     Cells {
@@ -206,6 +216,84 @@ fn build_cells(graph: &LayoutGraph, seg: &SegmentInfo, ordering: &Ordering) -> C
         children,
         parent_off,
         child_off,
+        segment_chains,
+    }
+}
+
+/// Makes each p/lane/q chain a single coordinate variable, then restores every
+/// per-rank separation inequality. Brandes–Köpf alignment is deliberately not
+/// used for this: conflict marking may reject an alignment even though segment
+/// continuity is a representation invariant.
+fn enforce_segment_constraints(cells: &Cells, node_gap: f64, xs: &mut [f64]) {
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = find(parent, parent[x]);
+        }
+        parent[x]
+    }
+
+    let n = xs.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    for chain in &cells.segment_chains {
+        for pair in chain.windows(2) {
+            let a = find(&mut parent, pair[0]);
+            let b = find(&mut parent, pair[1]);
+            parent[b] = a;
+        }
+    }
+    let groups: Vec<usize> = (0..n).map(|i| find(&mut parent, i)).collect();
+
+    // Seed each equality block at the mean of the four-pass result.
+    let mut total = vec![0.0; n];
+    let mut count = vec![0usize; n];
+    for (i, &g) in groups.iter().enumerate() {
+        total[g] += xs[i];
+        count[g] += 1;
+    }
+    let mut value = vec![0.0; n];
+    for i in 0..n {
+        if count[i] != 0 {
+            value[i] = total[i] / count[i] as f64;
+        }
+    }
+
+    // Difference constraints x[right] >= x[left] + separation. Relaxing them
+    // also covers constraints on ranks between p and q, whose coordinates are
+    // otherwise transient and unavailable to the router.
+    for _ in 0..n {
+        let mut changed = false;
+        for layer in &cells.layers {
+            for pair in layer.windows(2) {
+                let (left, right) = (pair[0], pair[1]);
+                let (a, b) = (groups[left], groups[right]);
+                if a == b {
+                    continue;
+                }
+                let sep = (cells.width[left] + cells.width[right]) / 2.0 + node_gap;
+                let required = value[a] + sep;
+                if value[b] < required {
+                    value[b] = required;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    debug_assert!(
+        cells
+            .layers
+            .iter()
+            .all(|layer| layer.windows(2).all(|pair| {
+                let sep = (cells.width[pair[0]] + cells.width[pair[1]]) / 2.0 + node_gap;
+                value[groups[pair[1]]] + 1e-9 >= value[groups[pair[0]]] + sep
+            })),
+        "incompatible segment/order constraints"
+    );
+
+    for (i, &g) in groups.iter().enumerate() {
+        xs[i] = value[g];
     }
 }
 
