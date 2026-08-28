@@ -22,8 +22,9 @@ pub enum EdgeStyle {
     #[default]
     Orthogonal,
     /// Use a direct anchor-to-anchor polyline for each safe edge. Edges whose
-    /// direct chain would enter a node use orthogonal channel lanes; safe edges
-    /// in the same component remain straight.
+    /// direct chain would enter a node use orthogonal channel lanes. A direct
+    /// edge sharing a collinear route interior with such a fallback is promoted
+    /// too; all other safe edges in the component remain straight.
     Straight,
 }
 
@@ -49,14 +50,39 @@ impl EdgeRouter for StraightRouter {
             .partition(|(_, chain)| straight_chain_is_safe(graph, chain));
         // All fallback chains are assigned together, so they share the same
         // channel occupancy/lane deconfliction as an orthogonal component.
-        let mut out = route_orthogonal_chains(graph, layers, &fallback);
-        for (orig, chain) in safe {
-            let points = simplify(chain.anchors);
-            if points.len() >= 2 {
-                out.insert(orig, points);
+        // A direct route can itself reserve a vertical or horizontal line used
+        // by a fallback.  In that case promote just that direct chain and
+        // recompute the lanes: this is monotone (a chain is promoted once) and
+        // leaves unrelated safe chains direct.
+        let mut safe = safe;
+        let mut fallback = fallback;
+        loop {
+            let mut out = route_orthogonal_chains(graph, layers, &fallback);
+            let direct: HashMap<usize, Vec<Point>> = safe
+                .iter()
+                .map(|(orig, chain)| (*orig, simplify(chain.anchors.clone())))
+                .filter(|(_, points)| points.len() >= 2)
+                .collect();
+            let occupied_by_fallback: Vec<_> = out.iter().collect();
+            let mut promote: Vec<usize> = direct
+                .iter()
+                .filter_map(|(orig, points)| {
+                    occupied_by_fallback
+                        .iter()
+                        .any(|(_, fallback)| routes_have_collinear_overlap(points, fallback))
+                        .then_some(*orig)
+                })
+                .collect();
+            promote.sort_unstable();
+            if promote.is_empty() {
+                out.extend(direct);
+                return out;
+            }
+            for orig in promote {
+                let index = safe.iter().position(|(id, _)| *id == orig).unwrap();
+                fallback.push(safe.remove(index));
             }
         }
-        out
     }
 }
 
@@ -606,6 +632,26 @@ fn simplify(points: Vec<Point>) -> Vec<Point> {
     out
 }
 
+/// True when distinct route interiors share a horizontal or vertical line.
+/// Ordinary point crossings (including straight diagonal crossings) are not
+/// collinear overlap and remain part of the layout's crossing semantics.
+fn routes_have_collinear_overlap(a: &[Point], b: &[Point]) -> bool {
+    a.windows(2).any(|left| {
+        b.windows(2).any(|right| {
+            let (p, q) = (left[0], left[1]);
+            let (r, s) = (right[0], right[1]);
+            if (p.y - q.y).abs() < EPS && (r.y - s.y).abs() < EPS && (p.y - r.y).abs() < EPS {
+                p.x.min(q.x).max(r.x.min(s.x)) + EPS < p.x.max(q.x).min(r.x.max(s.x))
+            } else if (p.x - q.x).abs() < EPS && (r.x - s.x).abs() < EPS && (p.x - r.x).abs() < EPS
+            {
+                p.y.min(q.y).max(r.y.min(s.y)) + EPS < p.y.max(q.y).min(r.y.max(s.y))
+            } else {
+                false
+            }
+        })
+    })
+}
+
 fn points_eq(a: Point, b: Point) -> bool {
     (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9
 }
@@ -703,6 +749,11 @@ mod tests {
             horizontal_y(&result[&1]),
             horizontal_y(&result[&2]),
             "overlapping fallback jogs need distinct lanes"
+        );
+        assert!(
+            !routes_have_collinear_overlap(&result[&0], &result[&1])
+                && !routes_have_collinear_overlap(&result[&0], &result[&2]),
+            "safe and fallback routes must not share a route interior"
         );
         assert_eq!(result, StraightRouter.route(&graph, &layers));
     }
