@@ -5,3 +5,6 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 3a3dda5610d0a1c7f954943a9b7848b8de96255d5e6ddeae831e4f5b272f5404 # shrinks to node_count = 6, edge_pairs = [(5, 8), (0, 1), (1, 6), (5, 0), (3, 8), (5, 8), (5, 5), (8, 5)], dimensions = [(10, 10)], node_gap = 8, layer_gap = 16, sweeps = 1, orthogonal = true
+cc cbeb69edb728532c33f22dabb08decaaedd5cfcc8dae655d1c6e3dcc9e3f2244 # shrinks to node_count = 6, edge_pairs = [], dimensions = [(12, 10), (21, 10), (10, 10), (10, 10), (10, 10), (13, 10)], node_gap = 8, layer_gap = 16, sweeps = 1, orthogonal = false, sese = true
+cc fab0d8bec5001f204d2972c33de62e2e64c2b855553ef9e343acdc7e747923e6 # shrinks to node_count = 6, edge_pairs = [], dimensions = [(10, 10), (10, 10), (10, 10), (10, 10), (10, 10), (10, 29)], node_gap = 8, layer_gap = 16, sweeps = 1, orthogonal = false, sese = true
+cc b7197db54e7b795e375029fca2d35594daf37e8407bcc7e5a346a570b5bbcf8a # shrinks to node_count = 10, edge_pairs = [(1, 5), (7, 13), (13, 7), (11, 13), (2, 0)], dimensions = [(10, 10), (10, 10)], root_index = 8, orthogonal = false, sese = true

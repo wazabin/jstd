@@ -14,7 +14,12 @@
 //! 6. [`router`] — turn the positioned graph into edge waypoints.
 //! 7. [`render`] — SVG/HTML output.
 //!
-//! The public entry point is [`layout::LayoutBuilder`].
+//! The public entry point is [`layout::LayoutBuilder`]. By default each weak
+//! component runs as one flat layered graph. [`layout::LayoutMode::Sese`] is an
+//! opt-in CFG mode: canonical edge-based SESE regions are replaced by sized
+//! proxies, laid out bottom-up, expanded, and then routed through explicit
+//! obstacle-free boundary corridors. Weak components are still packed side by
+//! side.
 
 pub mod coordinate;
 pub mod cycle;

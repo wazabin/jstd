@@ -14,7 +14,13 @@ use std::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
-    graph::{Graph, GraphMut, edge::Edge, node::Node, owning::OwningGraph},
+    graph::{
+        Graph, GraphMut,
+        analysis::{SeseTree, compute_sese},
+        edge::Edge,
+        node::Node,
+        owning::OwningGraph,
+    },
     registry::Identifier,
     triskel::{
         coordinate, cycle, order, rank,
@@ -101,6 +107,15 @@ impl Default for NodeGeometry {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Lay out each weak component as one Eiglsperger graph.
+    #[default]
+    Flat,
+    /// Recursively lay out canonical SESE regions as sized quotient nodes.
+    Sese,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayoutSettings {
     /// Vertical gap between the facing edges of adjacent ranks.
@@ -111,6 +126,8 @@ pub struct LayoutSettings {
     pub edge_style: EdgeStyle,
     /// Maximum up/down ordering sweeps during crossing reduction.
     pub max_sweeps: usize,
+    /// Component orchestration strategy.
+    pub mode: LayoutMode,
 }
 
 impl Default for LayoutSettings {
@@ -120,6 +137,7 @@ impl Default for LayoutSettings {
             node_gap: DEFAULT_NODE_GAP,
             edge_style: EdgeStyle::default(),
             max_sweeps: DEFAULT_MAX_SWEEPS,
+            mode: LayoutMode::Flat,
         }
     }
 }
@@ -300,6 +318,11 @@ where
         self
     }
 
+    pub fn mode(mut self, mode: LayoutMode) -> Self {
+        self.settings.mode = mode;
+        self
+    }
+
     pub fn settings(mut self, settings: LayoutSettings) -> Self {
         self.settings = settings;
         self
@@ -339,8 +362,18 @@ where
         let mut x_offset = 0.0f64;
 
         for component in components {
-            let local =
-                layout_component(self.graph, &component, &geometry, self.root, &self.settings);
+            let local = match self.settings.mode {
+                LayoutMode::Flat => {
+                    layout_component(self.graph, &component, &geometry, self.root, &self.settings)
+                }
+                LayoutMode::Sese => layout_component_sese(
+                    self.graph,
+                    &component,
+                    &geometry,
+                    self.root,
+                    &self.settings,
+                ),
+            };
 
             let (min_x, max_x, min_y) = local_bounds(&local);
             let shift_x = x_offset - min_x;
@@ -376,6 +409,241 @@ where
 struct ComponentLayout<NodeId: Identifier, EdgeId: Identifier> {
     nodes: HashMap<NodeId, LayoutNode<NodeId>>,
     edges: HashMap<EdgeId, Vec<Point>>,
+}
+
+fn layout_component_sese<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    component: &[NodeId],
+    geometry: &HashMap<NodeId, NodeGeometry>,
+    preferred_root: Option<NodeId>,
+    settings: &LayoutSettings,
+) -> ComponentLayout<NodeId, EdgeId>
+where
+    NodeId: Identifier + Debug + Ord,
+    EdgeId: Identifier + Debug + Ord,
+{
+    let component_set: HashSet<_> = component.iter().copied().collect();
+    let root = preferred_root
+        .filter(|root| component_set.contains(root))
+        .unwrap_or_else(|| *component.iter().min().unwrap());
+    let tree = compute_sese(graph, root);
+    if !tree.has_nontrivial_regions() || tree.root().contained_nodes.len() != component.len() {
+        return layout_component(graph, component, geometry, preferred_root, settings);
+    }
+
+    let composition = compose_sese_region(graph, geometry, settings, &tree, 0, root);
+    let RegionComposition {
+        mut nodes,
+        region_boxes,
+        ..
+    } = composition;
+    let mut edges = route_composed_edges(graph, component, &nodes, settings);
+    insert_region_attachments(graph, &tree, &region_boxes, &mut edges);
+    // Keep the component centred around its own bounds; the public packer will
+    // apply the final top/left translation.
+    let (min_x, max_x, min_y, max_y) = node_bounds(&nodes);
+    let dx = -(min_x + max_x) / 2.0;
+    let dy = -(min_y + max_y) / 2.0;
+    for node in nodes.values_mut() {
+        node.x += dx;
+        node.y += dy;
+    }
+    let edges = edges
+        .into_iter()
+        .map(|(id, points)| {
+            (
+                id,
+                points
+                    .into_iter()
+                    .map(|point| Point {
+                        x: point.x + dx,
+                        y: point.y + dy,
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    ComponentLayout { nodes, edges }
+}
+
+#[derive(Clone, Copy)]
+struct RegionBox {
+    region: usize,
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+}
+
+struct RegionComposition<NodeId: Identifier> {
+    nodes: HashMap<NodeId, LayoutNode<NodeId>>,
+    region_boxes: Vec<RegionBox>,
+    width: f64,
+    height: f64,
+}
+
+fn compose_sese_region<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    geometry: &HashMap<NodeId, NodeGeometry>,
+    settings: &LayoutSettings,
+    tree: &SeseTree<NodeId, EdgeId>,
+    region_id: usize,
+    component_root: NodeId,
+) -> RegionComposition<NodeId>
+where
+    NodeId: Identifier + Debug + Ord,
+    EdgeId: Identifier + Debug + Ord,
+{
+    let region = &tree.regions[region_id];
+    let children: Vec<_> = region
+        .children
+        .iter()
+        .map(|child| {
+            (
+                *child,
+                compose_sese_region(graph, geometry, settings, tree, *child, component_root),
+            )
+        })
+        .collect();
+
+    let mut quotient = OwningGraph::<usize, usize, (), ()>::default();
+    let mut entity_for_node = HashMap::default();
+    let mut direct_entity = HashMap::default();
+    let mut proxy_entity = HashMap::default();
+    let mut quotient_geometry = HashMap::default();
+    for &node in &region.nodes {
+        let entity = quotient.make_node(());
+        direct_entity.insert(entity, node);
+        entity_for_node.insert(node, entity);
+        quotient_geometry.insert(entity, geometry[&node]);
+    }
+    for (child_id, child) in &children {
+        let entity = quotient.make_node(());
+        proxy_entity.insert(*child_id, entity);
+        quotient_geometry.insert(
+            entity,
+            NodeGeometry {
+                width: child.width + settings.node_gap,
+                height: child.height + settings.layer_gap,
+            },
+        );
+        for &node in &tree.regions[*child_id].contained_nodes {
+            entity_for_node.insert(node, entity);
+        }
+    }
+
+    let contained: HashSet<_> = region.contained_nodes.iter().copied().collect();
+    let mut edge_ids: Vec<_> = graph.edges().map(|edge| edge.id()).collect();
+    edge_ids.sort();
+    for edge_id in edge_ids {
+        let edge = graph.get_edge(edge_id).unwrap();
+        let from = edge.from_id();
+        let to = edge.to_id();
+        if !contained.contains(&from) || !contained.contains(&to) || from == to {
+            continue;
+        }
+        let from_entity = entity_for_node[&from];
+        let to_entity = entity_for_node[&to];
+        if from_entity != to_entity {
+            quotient.make_edge(from_entity, to_entity, ());
+        }
+    }
+
+    let mut entities: Vec<_> = quotient.nodes().map(|node| node.id()).collect();
+    entities.sort_unstable();
+    let entry_node = region
+        .entry_edge
+        .and_then(|edge| graph.get_edge(edge).map(|edge| edge.to_id()))
+        .unwrap_or(component_root);
+    let quotient_root = entity_for_node
+        .get(&entry_node)
+        .copied()
+        .unwrap_or_else(|| entities[0]);
+    let mut flat_settings = *settings;
+    flat_settings.mode = LayoutMode::Flat;
+    let quotient_layout = layout_component(
+        &quotient,
+        &entities,
+        &quotient_geometry,
+        Some(quotient_root),
+        &flat_settings,
+    );
+
+    let mut nodes = HashMap::default();
+    for (entity, original) in direct_entity {
+        let positioned = quotient_layout.nodes[&entity];
+        let geom = geometry[&original];
+        nodes.insert(
+            original,
+            LayoutNode {
+                id: original,
+                x: positioned.x,
+                y: positioned.y,
+                width: geom.width,
+                height: geom.height,
+            },
+        );
+    }
+    let mut region_boxes = Vec::new();
+    for (child_id, mut child) in children {
+        let proxy = quotient_layout.nodes[&proxy_entity[&child_id]];
+        for (_, mut node) in child.nodes.drain() {
+            node.x += proxy.x;
+            node.y += proxy.y;
+            nodes.insert(node.id, node);
+        }
+        for mut region_box in child.region_boxes {
+            region_box.min_x += proxy.x;
+            region_box.max_x += proxy.x;
+            region_box.min_y += proxy.y;
+            region_box.max_y += proxy.y;
+            region_boxes.push(region_box);
+        }
+    }
+    let (min_x, max_x, min_y, max_y) = node_bounds(&nodes);
+    let center_x = (min_x + max_x) / 2.0;
+    let center_y = (min_y + max_y) / 2.0;
+    for node in nodes.values_mut() {
+        node.x -= center_x;
+        node.y -= center_y;
+    }
+    for region_box in &mut region_boxes {
+        region_box.min_x -= center_x;
+        region_box.max_x -= center_x;
+        region_box.min_y -= center_y;
+        region_box.max_y -= center_y;
+    }
+    region_boxes.push(RegionBox {
+        region: region_id,
+        min_x: min_x - center_x - settings.node_gap / 2.0,
+        max_x: max_x - center_x + settings.node_gap / 2.0,
+        min_y: min_y - center_y - settings.layer_gap / 2.0,
+        max_y: max_y - center_y + settings.layer_gap / 2.0,
+    });
+    RegionComposition {
+        nodes,
+        region_boxes,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    }
+}
+
+fn node_bounds<NodeId: Identifier>(
+    nodes: &HashMap<NodeId, LayoutNode<NodeId>>,
+) -> (f64, f64, f64, f64) {
+    let mut bounds = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for node in nodes.values() {
+        bounds.0 = bounds.0.min(node.x - node.width / 2.0);
+        bounds.1 = bounds.1.max(node.x + node.width / 2.0);
+        bounds.2 = bounds.2.min(node.y - node.height / 2.0);
+        bounds.3 = bounds.3.max(node.y + node.height / 2.0);
+    }
+    bounds
 }
 
 fn layout_component<NodeId, EdgeId, NodeData, EdgeData>(
@@ -498,6 +766,270 @@ where
     }
 
     ComponentLayout { nodes, edges }
+}
+
+fn insert_region_attachments<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    tree: &SeseTree<NodeId, EdgeId>,
+    boxes: &[RegionBox],
+    routes: &mut HashMap<EdgeId, Vec<Point>>,
+) where
+    NodeId: Identifier + Debug,
+    EdgeId: Identifier + Debug,
+{
+    for (edge_id, points) in routes.iter_mut() {
+        let edge = graph.get_edge(*edge_id).unwrap();
+        let from = edge.from_id();
+        let to = edge.to_id();
+        let relevant: Vec<_> = boxes
+            .iter()
+            .filter(|region_box| region_box.region != 0)
+            .filter(|region_box| {
+                let region = &tree.regions[region_box.region];
+                region.contained_nodes.contains(&from) != region.contained_nodes.contains(&to)
+            })
+            .copied()
+            .collect();
+        if relevant.is_empty() {
+            continue;
+        }
+        let mut expanded = Vec::new();
+        for pair in points.windows(2) {
+            expanded.push(pair[0]);
+            let mut hits = Vec::<(f64, Point)>::new();
+            for region_box in &relevant {
+                rectangle_boundary_hits(pair[0], pair[1], *region_box, &mut hits);
+            }
+            hits.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
+            hits.dedup_by(|lhs, rhs| {
+                (lhs.1.x - rhs.1.x).abs() < 1e-9 && (lhs.1.y - rhs.1.y).abs() < 1e-9
+            });
+            expanded.extend(hits.into_iter().map(|(_, point)| point));
+        }
+        if let Some(&last) = points.last() {
+            expanded.push(last);
+        }
+        *points = expanded;
+    }
+}
+
+fn rectangle_boundary_hits(a: Point, b: Point, rect: RegionBox, out: &mut Vec<(f64, Point)>) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let mut add = |t: f64| {
+        if t > 1e-9 && t < 1.0 - 1e-9 {
+            let point = Point {
+                x: a.x + t * dx,
+                y: a.y + t * dy,
+            };
+            if point.x >= rect.min_x - 1e-9
+                && point.x <= rect.max_x + 1e-9
+                && point.y >= rect.min_y - 1e-9
+                && point.y <= rect.max_y + 1e-9
+            {
+                out.push((t, point));
+            }
+        }
+    };
+    if dx.abs() > 1e-12 {
+        add((rect.min_x - a.x) / dx);
+        add((rect.max_x - a.x) / dx);
+    }
+    if dy.abs() > 1e-12 {
+        add((rect.min_y - a.y) / dy);
+        add((rect.max_y - a.y) / dy);
+    }
+}
+
+fn route_composed_edges<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    component: &[NodeId],
+    nodes: &HashMap<NodeId, LayoutNode<NodeId>>,
+    settings: &LayoutSettings,
+) -> HashMap<EdgeId, Vec<Point>>
+where
+    NodeId: Identifier + Debug,
+    EdgeId: Identifier + Debug,
+{
+    let contained: HashSet<_> = component.iter().copied().collect();
+    let mut edge_ids: Vec<_> = graph.edges().map(|edge| edge.id()).collect();
+    edge_ids.sort_by_key(|id| Into::<usize>::into(*id));
+    let mut routes = HashMap::default();
+    let mut loop_counts = HashMap::<NodeId, u32>::default();
+    for &edge_id in &edge_ids {
+        let edge = graph.get_edge(edge_id).unwrap();
+        if edge.from_id() == edge.to_id() && contained.contains(&edge.from_id()) {
+            *loop_counts.entry(edge.from_id()).or_default() += 1;
+        }
+    }
+    let mut loop_index = HashMap::<NodeId, u32>::default();
+    for (lane, edge_id) in edge_ids.into_iter().enumerate() {
+        let edge = graph.get_edge(edge_id).unwrap();
+        let from = edge.from_id();
+        let to = edge.to_id();
+        if !contained.contains(&from) {
+            continue;
+        }
+        let source = nodes[&from];
+        if from == to {
+            let index = loop_index.entry(from).or_default();
+            routes.insert(
+                edge_id,
+                self_loop_waypoints(
+                    source.x,
+                    source.y,
+                    source.width,
+                    source.height,
+                    *index,
+                    loop_counts[&from],
+                ),
+            );
+            *index += 1;
+            continue;
+        }
+        let target = nodes[&to];
+        let occupied: Vec<_> = routes.values().cloned().collect();
+        routes.insert(
+            edge_id,
+            obstacle_route(nodes, source, target, lane, settings, &occupied),
+        );
+    }
+    routes
+}
+
+fn polylines_overlap(a: &[Point], b: &[Point]) -> bool {
+    const EPS: f64 = 1e-6;
+    a.windows(2).any(|lhs| {
+        b.windows(2).any(|rhs| {
+            let lhs_vertical = (lhs[0].x - lhs[1].x).abs() < EPS;
+            let rhs_vertical = (rhs[0].x - rhs[1].x).abs() < EPS;
+            if lhs_vertical && rhs_vertical && (lhs[0].x - rhs[0].x).abs() < EPS {
+                lhs[0].y.min(lhs[1].y).max(rhs[0].y.min(rhs[1].y)) + EPS
+                    < lhs[0].y.max(lhs[1].y).min(rhs[0].y.max(rhs[1].y))
+            } else if !lhs_vertical && !rhs_vertical && (lhs[0].y - rhs[0].y).abs() < EPS {
+                lhs[0].x.min(lhs[1].x).max(rhs[0].x.min(rhs[1].x)) + EPS
+                    < lhs[0].x.max(lhs[1].x).min(rhs[0].x.max(rhs[1].x))
+            } else {
+                false
+            }
+        })
+    })
+}
+
+fn obstacle_route<NodeId: Identifier>(
+    nodes: &HashMap<NodeId, LayoutNode<NodeId>>,
+    source: LayoutNode<NodeId>,
+    target: LayoutNode<NodeId>,
+    lane: usize,
+    settings: &LayoutSettings,
+    occupied: &[Vec<Point>],
+) -> Vec<Point> {
+    let offset = lane as f64 * 0.25;
+    // Deterministic face ports prevent incident edges from sharing their first
+    // or final segment. The quotient router only needs stable uniqueness here;
+    // the normal flat router uses its degree-aware fan assignment.
+    let port_fraction = (((lane % 29) + 1) as f64 / 30.0 - 0.5) * 0.8;
+    let anchors = |node: LayoutNode<NodeId>| {
+        [
+            Point {
+                x: node.x + node.width * port_fraction,
+                y: node.y - node.height / 2.0,
+            },
+            Point {
+                x: node.x + node.width / 2.0,
+                y: node.y + node.height * port_fraction,
+            },
+            Point {
+                x: node.x + node.width * port_fraction,
+                y: node.y + node.height / 2.0,
+            },
+            Point {
+                x: node.x - node.width / 2.0,
+                y: node.y + node.height * port_fraction,
+            },
+        ]
+    };
+    let source_anchors = anchors(source);
+    let target_anchors = anchors(target);
+    let clear = |a: Point, b: Point| {
+        nodes.values().all(|node| {
+            !crate::triskel::geometry::segment_enters_rect_strict(
+                a,
+                b,
+                Point {
+                    x: node.x,
+                    y: node.y,
+                },
+                node.width,
+                node.height,
+            )
+        })
+    };
+    let (min_x, max_x, min_y, max_y) = node_bounds(nodes);
+    // Region-boundary edges use edge-private exterior corridors. Besides
+    // avoiding every expanded child box, this prevents two independently
+    // expanded regions from selecting the same interior lane.
+    let xs = [
+        min_x - settings.node_gap - offset,
+        max_x + settings.node_gap + offset,
+    ];
+    let ys = [
+        min_y - settings.layer_gap - offset,
+        max_y + settings.layer_gap + offset,
+    ];
+    let mut best: Option<(f64, Vec<Point>)> = None;
+    for &a in &source_anchors {
+        for &b in &target_anchors {
+            for &x in &xs {
+                let candidate = [a, Point { x, y: a.y }, Point { x, y: b.y }, b];
+                if candidate.windows(2).all(|pair| clear(pair[0], pair[1]))
+                    && !occupied
+                        .iter()
+                        .any(|route| polylines_overlap(&candidate, route))
+                {
+                    let length: f64 = candidate
+                        .windows(2)
+                        .map(|pair| (pair[0].x - pair[1].x).abs() + (pair[0].y - pair[1].y).abs())
+                        .sum();
+                    if best.as_ref().is_none_or(|(old, _)| length < *old) {
+                        best = Some((length, candidate.to_vec()));
+                    }
+                }
+            }
+            for &y in &ys {
+                let candidate = [a, Point { x: a.x, y }, Point { x: b.x, y }, b];
+                if candidate.windows(2).all(|pair| clear(pair[0], pair[1]))
+                    && !occupied
+                        .iter()
+                        .any(|route| polylines_overlap(&candidate, route))
+                {
+                    let length: f64 = candidate
+                        .windows(2)
+                        .map(|pair| (pair[0].x - pair[1].x).abs() + (pair[0].y - pair[1].y).abs())
+                        .sum();
+                    if best.as_ref().is_none_or(|(old, _)| length < *old) {
+                        best = Some((length, candidate.to_vec()));
+                    }
+                }
+            }
+        }
+    }
+    let points = best.map(|(_, points)| points).unwrap_or_else(|| {
+        let x = max_x + settings.node_gap + offset;
+        vec![
+            source_anchors[1],
+            Point { x, y: source.y },
+            Point { x, y: target.y },
+            target_anchors[1],
+        ]
+    });
+    let mut simplified = Vec::new();
+    for point in points {
+        if simplified.last() != Some(&point) {
+            simplified.push(point);
+        }
+    }
+    simplified
 }
 
 /// Assigns each node a y by rank, using the tallest node in each rank so bends
@@ -830,6 +1362,7 @@ mod tests {
             layer_gap in 16u32..=80,
             sweeps in 1usize..=6,
             orthogonal in any::<bool>(),
+            sese in any::<bool>(),
         ) {
             let mut graph = G::default();
             let nodes: Vec<_> = (0..node_count).map(|_| graph.make_node(())).collect();
@@ -849,6 +1382,7 @@ mod tests {
                 .layer_gap(layer_gap as f64)
                 .max_sweeps(sweeps)
                 .edge_style(if orthogonal { EdgeStyle::Orthogonal } else { EdgeStyle::Straight })
+                .mode(if sese { LayoutMode::Sese } else { LayoutMode::Flat })
                 .geometry(|id| {
                     let (width, height) = geometry[usize::from(id) % geometry.len()];
                     NodeGeometry { width: width as f64, height: height as f64 }
@@ -899,6 +1433,7 @@ mod tests {
             dimensions in proptest::collection::vec((10u32..=140, 10u32..=80), 2..=10),
             root_index in 0usize..24,
             orthogonal in any::<bool>(),
+            sese in any::<bool>(),
         ) {
             // This deliberately uses proptest rather than seed enumeration, so
             // failures shrink to an edge list, root, dimensions, and style.
@@ -914,6 +1449,7 @@ mod tests {
                 .root(nodes[root_index % node_count])
                 .max_sweeps(8)
                 .edge_style(if orthogonal { EdgeStyle::Orthogonal } else { EdgeStyle::Straight })
+                .mode(if sese { LayoutMode::Sese } else { LayoutMode::Flat })
                 .geometry(|id| {
                     let (width, height) = geometry[usize::from(id) % geometry.len()];
                     NodeGeometry { width: width as f64, height: height as f64 }
@@ -1310,6 +1846,67 @@ mod tests {
     }
 
     #[test]
+    fn sese_mode_expands_nested_regions_and_preserves_routes() {
+        let mut graph = G::default();
+        let nodes: Vec<_> = (0..10).map(|_| graph.make_node(())).collect();
+        let mut endpoints = HashMap::default();
+        for (from, to) in [
+            (0, 1),
+            (1, 2),
+            (1, 3),
+            (2, 4),
+            (3, 4),
+            (4, 5),
+            (5, 6),
+            (5, 7),
+            (6, 8),
+            (7, 8),
+            (8, 9),
+        ] {
+            let edge = graph.make_edge(nodes[from], nodes[to], ());
+            endpoints.insert(edge, (nodes[from], nodes[to]));
+        }
+        let build = || {
+            LayoutBuilder::new(&graph)
+                .root(nodes[0])
+                .mode(LayoutMode::Sese)
+                .geometry(|id| NodeGeometry {
+                    width: 30.0 + usize::from(id) as f64 * 3.0,
+                    height: 24.0,
+                })
+                .build()
+                .unwrap()
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(signature(&first), signature(&second));
+        assert_eq!(first.nodes.len(), nodes.len());
+        assert_eq!(first.edges.len(), endpoints.len());
+        assert_no_node_overlap(&first);
+        assert_no_edge_through_nonincident_node(&first, &endpoints);
+        for points in first.edges.values() {
+            assert!(points.len() >= 2);
+            assert!(points.windows(2).all(|pair| {
+                (pair[0].x - pair[1].x).abs() < 1e-6 || (pair[0].y - pair[1].y).abs() < 1e-6
+            }));
+        }
+    }
+
+    #[test]
+    fn sese_mode_falls_back_for_unstructured_component() {
+        let mut graph = G::default();
+        let root = graph.make_node(());
+        graph.make_edge(root, root, ());
+        let flat = LayoutBuilder::new(&graph).root(root).build().unwrap();
+        let sese = LayoutBuilder::new(&graph)
+            .root(root)
+            .mode(LayoutMode::Sese)
+            .build()
+            .unwrap();
+        assert_eq!(signature(&flat), signature(&sese));
+    }
+
+    #[test]
     fn disconnected_components_pack_without_overlap() {
         let mut g = G::default();
         let a = g.make_node(());
@@ -1318,12 +1915,14 @@ mod tests {
         let d = g.make_node(());
         g.make_edge(a, b, ());
         g.make_edge(c, d, ());
-        let r = layout(&g, a);
-        assert_no_node_overlap(&r);
-        // Two components: their x-extents must not interleave.
-        let comp1_max = r.get_node(a).unwrap().x.max(r.get_node(b).unwrap().x);
-        let comp2_min = r.get_node(c).unwrap().x.min(r.get_node(d).unwrap().x);
-        assert!(comp2_min > comp1_max, "components overlap horizontally");
+        for mode in [LayoutMode::Flat, LayoutMode::Sese] {
+            let r = LayoutBuilder::new(&g).root(a).mode(mode).build().unwrap();
+            assert_no_node_overlap(&r);
+            // Two components: their x-extents must not interleave.
+            let comp1_max = r.get_node(a).unwrap().x.max(r.get_node(b).unwrap().x);
+            let comp2_min = r.get_node(c).unwrap().x.min(r.get_node(d).unwrap().x);
+            assert!(comp2_min > comp1_max, "components overlap horizontally");
+        }
     }
 
     #[test]
