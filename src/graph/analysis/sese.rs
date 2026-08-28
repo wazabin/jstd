@@ -157,26 +157,33 @@ where
         }
     }
 
-    // Canonical regions are the smallest region incident to each boundary.
+    // A canonical region is the smallest region for which an edge is an entry
+    // or exit boundary. A boundary may therefore be the exit of one canonical
+    // region and the entry of the next; consuming boundaries greedily would
+    // incorrectly merge sequential structured constructs.
     candidates.sort_by_key(|(a, b, nodes)| (nodes.len(), *a, *b));
-    let mut selected = Vec::<(usize, usize, BTreeSet<usize>)>::new();
-    let mut used_boundary = HashSet::default();
-    for candidate in candidates {
-        if used_boundary.contains(&candidate.0) || used_boundary.contains(&candidate.1) {
-            continue;
-        }
-        // Program-structure regions must be laminar. Ambiguous crossing pairs
-        // are not canonical and remain in their nearest enclosing region.
-        if selected.iter().any(|(_, _, other)| {
-            let intersects = candidate.2.iter().any(|node| other.contains(node));
-            intersects && !candidate.2.is_subset(other) && !other.is_subset(&candidate.2)
-        }) {
-            continue;
-        }
-        used_boundary.insert(candidate.0);
-        used_boundary.insert(candidate.1);
-        selected.push(candidate);
+    let mut smallest_for_boundary: HashMap<usize, usize> = HashMap::default();
+    for (index, (a, b, _)) in candidates.iter().enumerate() {
+        smallest_for_boundary.entry(*a).or_insert(index);
+        smallest_for_boundary.entry(*b).or_insert(index);
     }
+    let mut selected: Vec<_> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, (a, b, _))| {
+            smallest_for_boundary.get(a) == Some(index)
+                || smallest_for_boundary.get(b) == Some(index)
+        })
+        .map(|(_, candidate)| candidate.clone())
+        .collect();
+    // Defensive laminarity filter for malformed/irreducible flowgraphs. JPP
+    // canonical regions are laminar; crossing candidates belong to the root.
+    selected.retain(|(_, _, candidate)| {
+        !candidates.iter().any(|(_, _, other)| {
+            let intersects = candidate.iter().any(|node| other.contains(node));
+            intersects && !candidate.is_subset(other) && !other.is_subset(candidate)
+        })
+    });
     selected.sort_by_key(|(a, b, nodes)| (std::cmp::Reverse(nodes.len()), *a, *b));
 
     let mut regions = vec![SeseRegion {
@@ -328,6 +335,33 @@ mod tests {
             .expect("diamond region");
         assert_eq!(region.exit_edge, Some(exit));
         assert_eq!(region.contained_nodes, vec![a, b, c, d]);
+    }
+
+    #[test]
+    fn sequential_regions_may_share_a_boundary_edge() {
+        let mut graph = G::default();
+        let n: Vec<_> = (0..10).map(|_| graph.make_node(())).collect();
+        let first_entry = graph.make_edge(n[0], n[1], ());
+        graph.make_edge(n[1], n[2], ());
+        graph.make_edge(n[1], n[3], ());
+        graph.make_edge(n[2], n[4], ());
+        graph.make_edge(n[3], n[4], ());
+        let shared = graph.make_edge(n[4], n[5], ());
+        graph.make_edge(n[5], n[6], ());
+        graph.make_edge(n[5], n[7], ());
+        graph.make_edge(n[6], n[8], ());
+        graph.make_edge(n[7], n[8], ());
+        graph.make_edge(n[8], n[9], ());
+
+        let tree = compute_sese(&graph, n[0]);
+        assert!(tree.regions.iter().any(|region| {
+            region.entry_edge == Some(first_entry) && region.exit_edge == Some(shared)
+        }));
+        assert!(
+            tree.regions
+                .iter()
+                .any(|region| region.entry_edge == Some(shared))
+        );
     }
 
     #[test]
