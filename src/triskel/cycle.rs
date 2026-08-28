@@ -52,9 +52,14 @@ pub(crate) fn break_cycles(graph: &mut LayoutGraph, root: usize) {
         let edge = graph.get_edge(edge_id).unwrap();
         let source = edge.from_id(); // B: the descendant (lower) endpoint
         let target = edge.to_id(); // A: the ancestor (upper) endpoint
+        // Preserve fixed proxy attachments on the real ends of the gadget:
+        // `B -> B'` consumes `port_start`, and `A' -> A` consumes `port_end`.
+        // The virtual column ignores either value.
         let gadget = EdgeLayoutData {
             reversed: true,
             orig: edge.orig,
+            port_start: edge.port_start,
+            port_end: edge.port_end,
             ..Default::default()
         };
 

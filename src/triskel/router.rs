@@ -497,6 +497,17 @@ pub(crate) fn assign_ports(graph: &LayoutGraph) -> Ports {
         }
     }
 
+    // Fixed proxy ports override the ordinary fan allocation.  Applying this
+    // here keeps coordinate assignment and routing on the identical contract.
+    for edge in graph.edges() {
+        if let Some(offset) = edge.port_start {
+            start.insert(edge.id(), offset);
+        }
+        if let Some(offset) = edge.port_end {
+            end.insert(edge.id(), offset);
+        }
+    }
+
     Ports { start, end }
 }
 
@@ -580,8 +591,14 @@ fn snap_ports(graph: &LayoutGraph, mut ports: Ports) -> Ports {
         let outs = ordered_out_edges(graph, id);
         let n_out = outs.len();
         for (i, &eid) in outs.iter().enumerate() {
-            let to_id = graph.get_edge(eid).unwrap().to_id();
+            let edge = graph.get_edge(eid).unwrap();
+            let to_id = edge.to_id();
             let to = graph.get_node(to_id).unwrap();
+            // A fixed face attachment is a compositional equality, not a
+            // preference.  Never let straightening move either constrained
+            // endpoint (the other endpoint may still be adjusted below).
+            let fixed_start = edge.port_start.is_some();
+            let fixed_end = edge.port_end.is_some();
             if to.is_dummy {
                 continue;
             }
@@ -600,9 +617,19 @@ fn snap_ports(graph: &LayoutGraph, mut ports: Ports) -> Ports {
             }
             let a_even = from_x + ports.start[&eid];
             let b_even = to.x + ports.end[&eid];
-            let x = ((a_even + b_even) / 2.0).clamp(lo, hi);
-            ports.start.insert(eid, x - from_x);
-            ports.end.insert(eid, x - to.x);
+            let x = if fixed_start {
+                a_even
+            } else if fixed_end {
+                b_even
+            } else {
+                ((a_even + b_even) / 2.0).clamp(lo, hi)
+            };
+            if !fixed_start && (from_x + s_lo..=from_x + s_hi).contains(&x) {
+                ports.start.insert(eid, x - from_x);
+            }
+            if !fixed_end && (to.x + e_lo..=to.x + e_hi).contains(&x) {
+                ports.end.insert(eid, x - to.x);
+            }
         }
     }
 
@@ -671,6 +698,69 @@ mod tests {
             is_dummy: dummy,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn fixed_port_hints_override_fans_and_survive_snapping() {
+        let mut graph = LayoutGraph::default();
+        let source = node(&mut graph, 0, 0.0, 0.0, false);
+        let target = node(&mut graph, 1, 80.0, 50.0, false);
+        let edge = graph.make_edge(
+            source,
+            target,
+            EdgeLayoutData {
+                orig: 0,
+                port_start: Some(-7.0),
+                port_end: Some(6.0),
+                ..Default::default()
+            },
+        );
+
+        let assigned = assign_ports(&graph);
+        assert_eq!(assigned.start[&edge], -7.0);
+        assert_eq!(assigned.end[&edge], 6.0);
+        let snapped = snap_ports(&graph, assigned);
+        assert_eq!(snapped.start[&edge], -7.0);
+        assert_eq!(snapped.end[&edge], 6.0);
+    }
+
+    #[test]
+    fn fixed_ports_survive_back_edge_gadget() {
+        let mut graph = LayoutGraph::default();
+        let entry = node(&mut graph, 0, 0.0, 0.0, false);
+        let source = node(&mut graph, 1, 20.0, 50.0, false);
+        graph.make_edge(entry, source, EdgeLayoutData::default());
+        graph.make_edge(
+            source,
+            entry,
+            EdgeLayoutData {
+                orig: 1,
+                port_start: Some(4.0),
+                port_end: Some(-5.0),
+                ..Default::default()
+            },
+        );
+        crate::triskel::cycle::break_cycles(&mut graph, entry);
+
+        let ports = assign_ports(&graph);
+        let source_attach = graph
+            .edges()
+            .find(|edge| {
+                edge.reversed
+                    && !graph.get_node(edge.from_id()).unwrap().is_dummy
+                    && graph.get_node(edge.to_id()).unwrap().is_dummy
+            })
+            .unwrap();
+        let target_attach = graph
+            .edges()
+            .find(|edge| {
+                edge.reversed
+                    && graph.get_node(edge.from_id()).unwrap().is_dummy
+                    && !graph.get_node(edge.to_id()).unwrap().is_dummy
+            })
+            .unwrap();
+        assert_eq!(ports.start[&source_attach.id()], 4.0);
+        assert_eq!(ports.end[&target_attach.id()], -5.0);
     }
 
     #[test]

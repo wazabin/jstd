@@ -7,6 +7,7 @@
 //! back to the caller's strongly-typed node/edge ids.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt::{self, Debug},
 };
@@ -257,6 +258,10 @@ pub(crate) struct EdgeLayoutData {
     pub reversed: bool,
     /// The caller's original edge id (as `usize`) this internal edge belongs to.
     pub orig: usize,
+    /// Fixed offsets for composition through a region proxy.  These remain
+    /// layout-local: public graph edges never carry routing state.
+    pub port_start: Option<f64>,
+    pub port_end: Option<f64>,
 }
 
 impl Default for EdgeLayoutData {
@@ -266,11 +271,32 @@ impl Default for EdgeLayoutData {
             weight: 1,
             reversed: false,
             orig: 0,
+            port_start: None,
+            port_end: None,
         }
     }
 }
 
 pub(crate) type LayoutGraph = OwningGraph<usize, usize, NodeLayoutData, EdgeLayoutData>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum RegionPortId<NodeId> {
+    Entry,
+    Exit { source: NodeId },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProxyPort<NodeId> {
+    id: RegionPortId<NodeId>,
+    x_offset: f64,
+    is_entry: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PortHint {
+    source_bottom: Option<f64>,
+    target_top: Option<f64>,
+}
 
 /// Rank read as a layer index (ranks are normalised non-negative before use).
 pub(crate) fn layer_of(graph: &LayoutGraph, node: usize) -> usize {
@@ -725,11 +751,11 @@ where
     }
 
     let composition = compose_sese_region(graph, geometry, settings, &tree, 0, root);
-    // A proxy port is valid only when its compositional splice stays in the
-    // proxy's reserved margin.  Do not resurrect the old expanded-graph router
-    // to repair a bad splice: retain the flat layout's safety guarantee by
-    // falling back for that component instead.
-    if !routes_clear_of_nodes(&composition.nodes, &composition.edges)
+    // A proxy port is valid only when every parent/child endpoint equality and
+    // geometry invariant holds. Do not resurrect an expanded-graph router to
+    // repair a bad composition: retain flat layout as the defensive fallback.
+    if !composition.valid
+        || !routes_clear_of_nodes(&composition.nodes, &composition.edges)
         || !routes_are_deconflicted(&composition.edges)
         || (settings.edge_style == EdgeStyle::Orthogonal
             && !routes_are_orthogonal(&composition.edges))
@@ -794,21 +820,23 @@ struct RegionBox {
     max_y: f64,
 }
 
+struct RegionInterface<NodeId: Identifier> {
+    width: f64,
+    height: f64,
+    ports: BTreeMap<RegionPortId<NodeId>, ProxyPort<NodeId>>,
+    /// Internal routes start/end at the corresponding named boundary port.
+    entry_route: Option<Vec<Point>>,
+    exit_routes: HashMap<NodeId, Vec<Point>>,
+}
+
 struct RegionComposition<NodeId: Identifier, EdgeId: Identifier> {
     nodes: HashMap<NodeId, LayoutNode<NodeId>>,
     /// Original-edge routes produced by flat layouts at this region or one of
-    /// its descendants.  A region proxy is only an intermediate layout node:
-    /// these routes are retained and expanded, never globally rerouted.
+    /// its descendants. A region proxy is only an intermediate layout node.
     edges: HashMap<EdgeId, Vec<Point>>,
-    /// Synthetic boundary-interface paths. They are spliced into the parent
-    /// quotient edge when this region is expanded, but never exposed as edges.
-    entry_interface: Option<Vec<Point>>,
-    /// One terminal path for every original node with an edge leaving the
-    /// region. Node hammocks may have several exit edges to one exit node.
-    exit_interfaces: HashMap<NodeId, Vec<Point>>,
+    interface: RegionInterface<NodeId>,
+    valid: bool,
     region_boxes: Vec<RegionBox>,
-    width: f64,
-    height: f64,
 }
 
 fn compose_sese_region<NodeId, EdgeId, NodeData, EdgeData>(
@@ -835,6 +863,7 @@ where
         })
         .collect();
 
+    let mut valid = children.iter().all(|(_, child)| child.valid);
     let mut quotient = OwningGraph::<usize, usize, (), ()>::default();
     let mut entity_for_node = HashMap::default();
     let mut direct_entity = HashMap::default();
@@ -853,9 +882,11 @@ where
         child_for_proxy.insert(entity, *child_id);
         quotient_geometry.insert(
             entity,
+            // The parent proxy is exactly the child's interface rectangle.
+            // Its named ports are offsets from this same centre.
             NodeGeometry {
-                width: child.width + settings.node_gap,
-                height: child.height + settings.layer_gap,
+                width: child.interface.width,
+                height: child.interface.height,
             },
         );
         for &node in &tree.regions[*child_id].contained_nodes {
@@ -932,14 +963,81 @@ where
         .get(&entry_node)
         .copied()
         .unwrap_or_else(|| entities[0]);
+    // A quotient edge that touches a child proxy is constrained to the exact
+    // named child port. This is established before coordinate assignment and
+    // routing, rather than repaired while expanding the child.
+    let child_ports: HashMap<usize, BTreeMap<RegionPortId<NodeId>, ProxyPort<NodeId>>> = children
+        .iter()
+        .map(|(child_id, child)| (proxy_entity[child_id], child.interface.ports.clone()))
+        .collect();
+    let mut port_hints = HashMap::default();
+    for (&quotient_edge, &original) in &original_for_quotient {
+        let edge = graph.get_edge(original).unwrap();
+        let mut hint = PortHint::default();
+        if let Some(ports) = child_ports.get(&entity_for_node[&edge.from_id()]) {
+            hint.source_bottom = ports
+                .get(&RegionPortId::Exit {
+                    source: edge.from_id(),
+                })
+                .filter(|port| {
+                    !port.is_entry
+                        && port.id
+                            == RegionPortId::Exit {
+                                source: edge.from_id(),
+                            }
+                })
+                .map(|port| port.x_offset);
+        }
+        if let Some(ports) = child_ports.get(&entity_for_node[&edge.to_id()]) {
+            hint.target_top = ports
+                .get(&RegionPortId::Entry)
+                .filter(|port| port.is_entry && port.id == RegionPortId::Entry)
+                .map(|port| port.x_offset);
+        }
+        if hint.source_bottom.is_some() || hint.target_top.is_some() {
+            port_hints.insert(quotient_edge, hint);
+        }
+    }
+    if let Some((_, entry_link, exits)) = &interface {
+        let target = graph.get_edge(region.entry_edge.unwrap()).unwrap().to_id();
+        if let Some(port) = child_ports
+            .get(&entity_for_node[&target])
+            .and_then(|ports| ports.get(&RegionPortId::Entry))
+            .filter(|port| port.is_entry && port.id == RegionPortId::Entry)
+        {
+            port_hints.insert(
+                *entry_link,
+                PortHint {
+                    target_top: Some(port.x_offset),
+                    ..Default::default()
+                },
+            );
+        }
+        for (source, _, link) in exits {
+            if let Some(port) = child_ports
+                .get(&entity_for_node[source])
+                .and_then(|ports| ports.get(&RegionPortId::Exit { source: *source }))
+                .filter(|port| !port.is_entry && port.id == RegionPortId::Exit { source: *source })
+            {
+                port_hints.insert(
+                    *link,
+                    PortHint {
+                        source_bottom: Some(port.x_offset),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
     let mut flat_settings = *settings;
     flat_settings.mode = LayoutMode::Flat;
-    let quotient_layout = layout_component(
+    let quotient_layout = layout_component_with_port_hints(
         &quotient,
         &entities,
         &quotient_geometry,
         Some(quotient_root),
         &flat_settings,
+        &port_hints,
     );
 
     let (mut entry_interface, mut exit_interfaces) =
@@ -1006,18 +1104,23 @@ where
             region_box.max_y += proxy.y;
             region_boxes.push(region_box);
         }
-        let child_exits: HashMap<NodeId, Vec<Point>> = child
-            .exit_interfaces
-            .drain()
-            .map(|(source, points)| (source, translate_points(points, proxy.x, proxy.y)))
-            .collect();
-        child_interfaces.insert(
-            proxy_entity[&child_id],
-            (
-                translate_points(child.entry_interface.take().unwrap(), proxy.x, proxy.y),
-                child_exits,
-            ),
-        );
+        let child_interface = RegionInterface {
+            width: child.interface.width,
+            height: child.interface.height,
+            ports: child.interface.ports,
+            entry_route: child
+                .interface
+                .entry_route
+                .take()
+                .map(|points| translate_points(points, proxy.x, proxy.y)),
+            exit_routes: child
+                .interface
+                .exit_routes
+                .drain()
+                .map(|(source, points)| (source, translate_points(points, proxy.x, proxy.y)))
+                .collect(),
+        };
+        child_interfaces.insert(proxy_entity[&child_id], child_interface);
     }
 
     // Synthetic terminal links can themselves end at a nested proxy. Expand
@@ -1027,19 +1130,17 @@ where
         let target = graph.get_edge(entry).unwrap().to_id();
         let entity = entity_for_node[&target];
         if child_for_proxy.contains_key(&entity) {
-            let (nested_entry, _) = &child_interfaces[&entity];
+            let nested_entry = child_interfaces[&entity].entry_route.as_ref().unwrap();
             let points = entry_interface.as_mut().unwrap();
-            splice_points(points, nested_entry[0]);
-            points.extend(nested_entry.iter().copied().skip(1));
+            valid &= join_equal_points(points, nested_entry);
         }
     }
     for (&source, points) in &mut exit_interfaces {
         let entity = entity_for_node[&source];
         if child_for_proxy.contains_key(&entity) {
-            let (_, nested_exits) = &child_interfaces[&entity];
+            let nested_exits = &child_interfaces[&entity].exit_routes;
             let mut expanded = nested_exits[&source].clone();
-            splice_points(&mut expanded, points[0]);
-            expanded.extend(points.iter().copied().skip(1));
+            valid &= join_equal_points(&mut expanded, points);
             *points = expanded;
         }
     }
@@ -1056,16 +1157,17 @@ where
         let from = edge.from_id();
         let to = edge.to_id();
         if child_for_proxy.contains_key(&entity_for_node[&from]) {
-            let (_, exits) = &child_interfaces[&entity_for_node[&from]];
+            let exits = &child_interfaces[&entity_for_node[&from]].exit_routes;
             let mut expanded = exits[&from].clone();
-            splice_points(&mut expanded, points[0]);
-            expanded.extend(points.into_iter().skip(1));
+            valid &= join_equal_points(&mut expanded, &points);
             points = expanded;
         }
         if child_for_proxy.contains_key(&entity_for_node[&to]) {
-            let (entry, _) = &child_interfaces[&entity_for_node[&to]];
-            splice_points(&mut points, entry[0]);
-            points.extend(entry.iter().copied().skip(1));
+            let entry = child_interfaces[&entity_for_node[&to]]
+                .entry_route
+                .as_ref()
+                .unwrap();
+            valid &= join_equal_points(&mut points, entry);
         }
         simplify_points(&mut points);
         edges.insert(original, points);
@@ -1103,10 +1205,13 @@ where
         }
     }
 
-    // Interface terminals are part of a proxy's physical contract. Include
-    // their complete routed stubs in its bounds so the parent proxy face and
-    // debug rectangle enclose the actual entry/exit attachment geometry.
-    let (mut min_x, mut max_x, mut min_y, mut max_y) = node_bounds(&nodes);
+    // Debug bounds describe real child content plus one deliberate margin.
+    // Interface terminals are zero-area routing machinery and must not make a
+    // region rectangle taller or wider. The separate interface extent below is
+    // still retained for the proxy geometry used by the parent layout.
+    let (content_min_x, content_max_x, content_min_y, content_max_y) = node_bounds(&nodes);
+    let (mut min_x, mut max_x, mut min_y, mut max_y) =
+        (content_min_x, content_max_x, content_min_y, content_max_y);
     for point in entry_interface
         .iter()
         .flatten()
@@ -1135,10 +1240,10 @@ where
     region_boxes.push(RegionBox {
         id: region_id,
         parent: region.parent,
-        min_x: min_x - center_x - settings.node_gap / 2.0,
-        max_x: max_x - center_x + settings.node_gap / 2.0,
-        min_y: min_y - center_y - settings.layer_gap / 2.0,
-        max_y: max_y - center_y + settings.layer_gap / 2.0,
+        min_x: content_min_x - center_x - settings.node_gap / 2.0,
+        max_x: content_max_x - center_x + settings.node_gap / 2.0,
+        min_y: content_min_y - center_y - settings.layer_gap / 2.0,
+        max_y: content_max_y - center_y + settings.layer_gap / 2.0,
     });
     if let Some(points) = &mut entry_interface {
         translate_points_in_place(points, -center_x, -center_y);
@@ -1146,14 +1251,45 @@ where
     for points in exit_interfaces.values_mut() {
         translate_points_in_place(points, -center_x, -center_y);
     }
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+    let mut ports = BTreeMap::new();
+    if let Some(route) = &entry_interface {
+        let point = route[0];
+        valid &= (point.y + height / 2.0).abs() < 1e-6;
+        ports.insert(
+            RegionPortId::Entry,
+            ProxyPort {
+                id: RegionPortId::Entry,
+                x_offset: point.x,
+                is_entry: true,
+            },
+        );
+    }
+    for (&source, route) in &exit_interfaces {
+        let point = *route.last().unwrap();
+        valid &= (point.y - height / 2.0).abs() < 1e-6;
+        ports.insert(
+            RegionPortId::Exit { source },
+            ProxyPort {
+                id: RegionPortId::Exit { source },
+                x_offset: point.x,
+                is_entry: false,
+            },
+        );
+    }
     RegionComposition {
         nodes,
         edges,
-        entry_interface,
-        exit_interfaces,
+        interface: RegionInterface {
+            width,
+            height,
+            ports,
+            entry_route: entry_interface,
+            exit_routes: exit_interfaces,
+        },
+        valid,
         region_boxes,
-        width: max_x - min_x,
-        height: max_y - min_y,
     }
 }
 
@@ -1169,18 +1305,18 @@ fn translate_points_in_place(points: &mut [Point], dx: f64, dy: f64) {
     }
 }
 
-/// Join two compositional interface paths without selecting an expanded-graph
-/// route. Both endpoints are established by flat layouts; this only follows
-/// the proxy's empty margin with an orthogonal elbow.
-fn splice_points(points: &mut Vec<Point>, target: Point) {
-    let last = *points.last().unwrap();
-    if last.x != target.x && last.y != target.y {
-        points.push(Point {
-            x: target.x,
-            y: last.y,
-        });
+/// Concatenate routes at a router-native proxy port. A mismatch means a
+/// caller failed to carry the fixed port through the ordinary layout pipeline;
+/// inventing an elbow here would hide that error and violate SESE composition.
+fn join_equal_points(points: &mut Vec<Point>, suffix: &[Point]) -> bool {
+    const EPS: f64 = 1e-6;
+    let last = *points.last().expect("non-empty route");
+    let first = *suffix.first().expect("non-empty route");
+    let equal = (last.x - first.x).abs() <= EPS && (last.y - first.y).abs() <= EPS;
+    if equal {
+        points.extend(suffix.iter().copied().skip(1));
     }
-    points.push(target);
+    equal
 }
 
 fn simplify_points(points: &mut Vec<Point>) {
@@ -1283,6 +1419,28 @@ where
     NodeId: Identifier + Debug,
     EdgeId: Identifier + Debug,
 {
+    layout_component_with_port_hints(
+        graph,
+        component,
+        geometry,
+        preferred_root,
+        settings,
+        &HashMap::default(),
+    )
+}
+
+fn layout_component_with_port_hints<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    component: &[NodeId],
+    geometry: &HashMap<NodeId, NodeGeometry>,
+    preferred_root: Option<NodeId>,
+    settings: &LayoutSettings,
+    hints: &HashMap<EdgeId, PortHint>,
+) -> ComponentLayout<NodeId, EdgeId>
+where
+    NodeId: Identifier + Debug,
+    EdgeId: Identifier + Debug,
+{
     // Build an internal usize-id graph for this component, recording the
     // mapping back to the caller's node/edge ids.
     let mut local = LayoutGraph::default();
@@ -1327,6 +1485,8 @@ where
             to_local[&to],
             EdgeLayoutData {
                 orig: edge_id.into(),
+                port_start: hints.get(&edge_id).and_then(|hint| hint.source_bottom),
+                port_end: hints.get(&edge_id).and_then(|hint| hint.target_top),
                 ..Default::default()
             },
         );
@@ -2368,6 +2528,51 @@ mod tests {
             .expect("b..f hammock");
         assert_eq!(hammock.entry_edge, Some(entry));
         assert_eq!(hammock.exit_edge, Some(first_exit));
+
+        // The two exits are distinct named bottom-face ports. Their internal
+        // routes terminate exactly there, and composing the root records that
+        // every proxy join was an equality (rather than an inserted elbow).
+        let geometry: HashMap<_, _> = graph
+            .nodes()
+            .map(|node| (node.id(), NodeGeometry::default()))
+            .collect();
+        let hammock_id = tree
+            .regions
+            .iter()
+            .position(|region| region.contained_nodes == vec![b, c, d, e, f])
+            .unwrap();
+        let hammock_composition = compose_sese_region(
+            &graph,
+            &geometry,
+            &LayoutSettings::default(),
+            &tree,
+            hammock_id,
+            root,
+        );
+        assert!(hammock_composition.valid);
+        let first_port = hammock_composition.interface.ports[&RegionPortId::Exit { source: d }];
+        let second_port = hammock_composition.interface.ports[&RegionPortId::Exit { source: f }];
+        assert_ne!(first_port.x_offset, second_port.x_offset);
+        for (source, port) in [(d, first_port), (f, second_port)] {
+            assert!(!port.is_entry);
+            assert_eq!(port.id, RegionPortId::Exit { source });
+            assert!(port.x_offset.abs() <= hammock_composition.interface.width / 2.0);
+            let route = &hammock_composition.interface.exit_routes[&source];
+            let endpoint = route.last().unwrap();
+            assert!((endpoint.x - port.x_offset).abs() < 1e-6);
+            assert!((endpoint.y - hammock_composition.interface.height / 2.0).abs() < 1e-6);
+        }
+        assert!(
+            compose_sese_region(
+                &graph,
+                &geometry,
+                &LayoutSettings::default(),
+                &tree,
+                0,
+                root,
+            )
+            .valid
+        );
 
         let layout = LayoutBuilder::new(&graph)
             .root(root)
