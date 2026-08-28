@@ -1,3 +1,5 @@
 /target/
 Cargo.lock
 lcov.info
+# Ad-hoc output from `triskel-png`; examples may still keep images in subdirectories.
+/*.png
