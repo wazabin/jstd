@@ -427,7 +427,12 @@ where
         .filter(|root| component_set.contains(root))
         .unwrap_or_else(|| *component.iter().min().unwrap());
     let tree = compute_sese(graph, root);
-    if !tree.has_nontrivial_regions() || tree.root().contained_nodes.len() != component.len() {
+    let useful_region = tree
+        .regions
+        .iter()
+        .skip(1)
+        .any(|region| region.contained_nodes.len() > 1);
+    if !useful_region || tree.root().contained_nodes.len() != component.len() {
         return layout_component(graph, component, geometry, preferred_root, settings);
     }
 
@@ -965,6 +970,28 @@ fn obstacle_route<NodeId: Identifier>(
             )
         })
     };
+    if settings.edge_style == EdgeStyle::Straight {
+        let mut direct: Option<(f64, Vec<Point>)> = None;
+        for &a in &source_anchors {
+            for &b in &target_anchors {
+                let candidate = [a, b];
+                if clear(a, b)
+                    && !occupied
+                        .iter()
+                        .any(|route| polylines_overlap(&candidate, route))
+                {
+                    let length = (a.x - b.x).hypot(a.y - b.y);
+                    if direct.as_ref().is_none_or(|(old, _)| length < *old) {
+                        direct = Some((length, candidate.to_vec()));
+                    }
+                }
+            }
+        }
+        if let Some((_, points)) = direct {
+            return points;
+        }
+    }
+
     let (min_x, max_x, min_y, max_y) = node_bounds(nodes);
     // Region-boundary edges use edge-private exterior corridors. Besides
     // avoiding every expanded child box, this prevents two independently
@@ -1896,7 +1923,10 @@ mod tests {
     fn sese_mode_falls_back_for_unstructured_component() {
         let mut graph = G::default();
         let root = graph.make_node(());
-        graph.make_edge(root, root, ());
+        let middle = graph.make_node(());
+        let exit = graph.make_node(());
+        graph.make_edge(root, middle, ());
+        graph.make_edge(middle, exit, ());
         let flat = LayoutBuilder::new(&graph).root(root).build().unwrap();
         let sese = LayoutBuilder::new(&graph)
             .root(root)
