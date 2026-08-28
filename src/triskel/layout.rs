@@ -437,13 +437,16 @@ where
     }
 
     let composition = compose_sese_region(graph, geometry, settings, &tree, 0, root);
+    // A proxy port is valid only when its compositional splice stays in the
+    // proxy's reserved margin.  Do not resurrect the old expanded-graph router
+    // to repair a bad splice: retain the flat layout's safety guarantee by
+    // falling back for that component instead.
+    if !routes_clear_of_nodes(&composition.nodes, &composition.edges) {
+        return layout_component(graph, component, geometry, preferred_root, settings);
+    }
     let RegionComposition {
-        mut nodes,
-        region_boxes,
-        ..
+        mut nodes, edges, ..
     } = composition;
-    let mut edges = route_composed_edges(graph, component, &nodes, settings);
-    insert_region_attachments(graph, &tree, &region_boxes, &mut edges);
     // Keep the component centred around its own bounds; the public packer will
     // apply the final top/left translation.
     let (min_x, max_x, min_y, max_y) = node_bounds(&nodes);
@@ -471,18 +474,16 @@ where
     ComponentLayout { nodes, edges }
 }
 
-#[derive(Clone, Copy)]
-struct RegionBox {
-    region: usize,
-    min_x: f64,
-    max_x: f64,
-    min_y: f64,
-    max_y: f64,
-}
-
-struct RegionComposition<NodeId: Identifier> {
+struct RegionComposition<NodeId: Identifier, EdgeId: Identifier> {
     nodes: HashMap<NodeId, LayoutNode<NodeId>>,
-    region_boxes: Vec<RegionBox>,
+    /// Original-edge routes produced by flat layouts at this region or one of
+    /// its descendants.  A region proxy is only an intermediate layout node:
+    /// these routes are retained and expanded, never globally rerouted.
+    edges: HashMap<EdgeId, Vec<Point>>,
+    /// Synthetic boundary-interface paths. They are spliced into the parent
+    /// quotient edge when this region is expanded, but never exposed as edges.
+    entry_interface: Option<Vec<Point>>,
+    exit_interface: Option<Vec<Point>>,
     width: f64,
     height: f64,
 }
@@ -494,7 +495,7 @@ fn compose_sese_region<NodeId, EdgeId, NodeData, EdgeData>(
     tree: &SeseTree<NodeId, EdgeId>,
     region_id: usize,
     component_root: NodeId,
-) -> RegionComposition<NodeId>
+) -> RegionComposition<NodeId, EdgeId>
 where
     NodeId: Identifier + Debug + Ord,
     EdgeId: Identifier + Debug + Ord,
@@ -515,6 +516,7 @@ where
     let mut entity_for_node = HashMap::default();
     let mut direct_entity = HashMap::default();
     let mut proxy_entity = HashMap::default();
+    let mut child_for_proxy = HashMap::default();
     let mut quotient_geometry = HashMap::default();
     for &node in &region.nodes {
         let entity = quotient.make_node(());
@@ -525,6 +527,7 @@ where
     for (child_id, child) in &children {
         let entity = quotient.make_node(());
         proxy_entity.insert(*child_id, entity);
+        child_for_proxy.insert(entity, *child_id);
         quotient_geometry.insert(
             entity,
             NodeGeometry {
@@ -538,6 +541,34 @@ where
     }
 
     let contained: HashSet<_> = region.contained_nodes.iter().copied().collect();
+    let mut original_for_quotient = HashMap::default();
+    // A non-root region has explicit, invisible entry/exit terminals. Their
+    // ordinary flat-layout routes provide the internal half of a proxy port.
+    let interface = if let (Some(entry), Some(exit)) = (region.entry_edge, region.exit_edge) {
+        let entry_terminal = quotient.make_node(());
+        let exit_terminal = quotient.make_node(());
+        quotient_geometry.insert(
+            entry_terminal,
+            NodeGeometry {
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        quotient_geometry.insert(
+            exit_terminal,
+            NodeGeometry {
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        let entry_target = graph.get_edge(entry).unwrap().to_id();
+        let exit_source = graph.get_edge(exit).unwrap().from_id();
+        let entry_link = quotient.make_edge(entry_terminal, entity_for_node[&entry_target], ());
+        let exit_link = quotient.make_edge(entity_for_node[&exit_source], exit_terminal, ());
+        Some((entry_terminal, exit_terminal, entry_link, exit_link))
+    } else {
+        None
+    };
     let mut edge_ids: Vec<_> = graph.edges().map(|edge| edge.id()).collect();
     edge_ids.sort();
     for edge_id in edge_ids {
@@ -550,7 +581,8 @@ where
         let from_entity = entity_for_node[&from];
         let to_entity = entity_for_node[&to];
         if from_entity != to_entity {
-            quotient.make_edge(from_entity, to_entity, ());
+            let quotient_edge = quotient.make_edge(from_entity, to_entity, ());
+            original_for_quotient.insert(quotient_edge, edge_id);
         }
     }
 
@@ -574,6 +606,31 @@ where
         &flat_settings,
     );
 
+    let (mut entry_interface, mut exit_interface) =
+        if let Some((entry, exit, entry_link, exit_link)) = interface {
+            let entry_node = quotient_layout.nodes[&entry];
+            let exit_node = quotient_layout.nodes[&exit];
+            let mut entry_points = vec![
+                Point {
+                    x: entry_node.x,
+                    y: entry_node.y - entry_node.height / 2.0,
+                },
+                Point {
+                    x: entry_node.x,
+                    y: entry_node.y + entry_node.height / 2.0,
+                },
+            ];
+            entry_points.extend(quotient_layout.edges[&entry_link].iter().copied().skip(1));
+            let mut exit_points = quotient_layout.edges[&exit_link].clone();
+            exit_points.push(Point {
+                x: exit_node.x,
+                y: exit_node.y + exit_node.height / 2.0,
+            });
+            (Some(entry_points), Some(exit_points))
+        } else {
+            (None, None)
+        };
+
     let mut nodes = HashMap::default();
     for (entity, original) in direct_entity {
         let positioned = quotient_layout.nodes[&entity];
@@ -589,7 +646,8 @@ where
             },
         );
     }
-    let mut region_boxes = Vec::new();
+    let mut edges = HashMap::default();
+    let mut child_interfaces = HashMap::default();
     for (child_id, mut child) in children {
         let proxy = quotient_layout.nodes[&proxy_entity[&child_id]];
         for (_, mut node) in child.nodes.drain() {
@@ -597,14 +655,102 @@ where
             node.y += proxy.y;
             nodes.insert(node.id, node);
         }
-        for mut region_box in child.region_boxes {
-            region_box.min_x += proxy.x;
-            region_box.max_x += proxy.x;
-            region_box.min_y += proxy.y;
-            region_box.max_y += proxy.y;
-            region_boxes.push(region_box);
+        for (edge_id, points) in child.edges.drain() {
+            edges.insert(edge_id, translate_points(points, proxy.x, proxy.y));
+        }
+        child_interfaces.insert(
+            proxy_entity[&child_id],
+            (
+                translate_points(child.entry_interface.take().unwrap(), proxy.x, proxy.y),
+                translate_points(child.exit_interface.take().unwrap(), proxy.x, proxy.y),
+            ),
+        );
+    }
+
+    // Synthetic terminal links can themselves end at a nested proxy. Expand
+    // them exactly like an original quotient edge, so an interface always
+    // reaches the real boundary node rather than stopping at an inner proxy.
+    if let Some(entry) = region.entry_edge {
+        let target = graph.get_edge(entry).unwrap().to_id();
+        let entity = entity_for_node[&target];
+        if child_for_proxy.contains_key(&entity) {
+            let (nested_entry, _) = &child_interfaces[&entity];
+            let points = entry_interface.as_mut().unwrap();
+            splice_points(points, nested_entry[0]);
+            points.extend(nested_entry.iter().copied().skip(1));
         }
     }
+    if let Some(exit) = region.exit_edge {
+        let source = graph.get_edge(exit).unwrap().from_id();
+        let entity = entity_for_node[&source];
+        if child_for_proxy.contains_key(&entity) {
+            let (_, nested_exit) = &child_interfaces[&entity];
+            let mut points = nested_exit.clone();
+            splice_points(&mut points, exit_interface.as_ref().unwrap()[0]);
+            points.extend(exit_interface.take().unwrap().into_iter().skip(1));
+            exit_interface = Some(points);
+        }
+    }
+
+    // Every quotient edge retains the route from the ordinary flat pipeline.
+    // When an endpoint is a proxy, splice that route to the original endpoint
+    // inside the expanded region.  This is composition glue, not a second
+    // routing pass over the expanded graph.
+    for (quotient_edge, mut points) in quotient_layout.edges {
+        let Some(&original) = original_for_quotient.get(&quotient_edge) else {
+            continue; // synthetic entry/exit terminal edge
+        };
+        let edge = graph.get_edge(original).unwrap();
+        let from = edge.from_id();
+        let to = edge.to_id();
+        if child_for_proxy.contains_key(&entity_for_node[&from]) {
+            let (_, exit) = &child_interfaces[&entity_for_node[&from]];
+            let mut expanded = exit.clone();
+            splice_points(&mut expanded, points[0]);
+            expanded.extend(points.into_iter().skip(1));
+            points = expanded;
+        }
+        if child_for_proxy.contains_key(&entity_for_node[&to]) {
+            let (entry, _) = &child_interfaces[&entity_for_node[&to]];
+            splice_points(&mut points, entry[0]);
+            points.extend(entry.iter().copied().skip(1));
+        }
+        simplify_points(&mut points);
+        edges.insert(original, points);
+    }
+
+    // Self-loops are deliberately outside every quotient graph, just as they
+    // are in flat layout.  Emit them once at the root after all real positions
+    // are known.
+    if region_id == 0 {
+        let mut loop_index = HashMap::<NodeId, u32>::default();
+        let mut loop_count = HashMap::<NodeId, u32>::default();
+        for edge in graph.edges() {
+            if edge.from_id() == edge.to_id() && contained.contains(&edge.from_id()) {
+                *loop_count.entry(edge.from_id()).or_default() += 1;
+            }
+        }
+        for edge in graph.edges() {
+            if edge.from_id() != edge.to_id() || !contained.contains(&edge.from_id()) {
+                continue;
+            }
+            let node = nodes[&edge.from_id()];
+            let index = loop_index.entry(node.id).or_default();
+            edges.insert(
+                edge.id(),
+                self_loop_waypoints(
+                    node.x,
+                    node.y,
+                    node.width,
+                    node.height,
+                    *index,
+                    loop_count[&node.id],
+                ),
+            );
+            *index += 1;
+        }
+    }
+
     let (min_x, max_x, min_y, max_y) = node_bounds(&nodes);
     let center_x = (min_x + max_x) / 2.0;
     let center_y = (min_y + max_y) / 2.0;
@@ -612,25 +758,81 @@ where
         node.x -= center_x;
         node.y -= center_y;
     }
-    for region_box in &mut region_boxes {
-        region_box.min_x -= center_x;
-        region_box.max_x -= center_x;
-        region_box.min_y -= center_y;
-        region_box.max_y -= center_y;
+    for points in edges.values_mut() {
+        translate_points_in_place(points, -center_x, -center_y);
     }
-    region_boxes.push(RegionBox {
-        region: region_id,
-        min_x: min_x - center_x - settings.node_gap / 2.0,
-        max_x: max_x - center_x + settings.node_gap / 2.0,
-        min_y: min_y - center_y - settings.layer_gap / 2.0,
-        max_y: max_y - center_y + settings.layer_gap / 2.0,
-    });
+    if let Some(points) = &mut entry_interface {
+        translate_points_in_place(points, -center_x, -center_y);
+    }
+    if let Some(points) = &mut exit_interface {
+        translate_points_in_place(points, -center_x, -center_y);
+    }
     RegionComposition {
         nodes,
-        region_boxes,
+        edges,
+        entry_interface,
+        exit_interface,
         width: max_x - min_x,
         height: max_y - min_y,
     }
+}
+
+fn translate_points(mut points: Vec<Point>, dx: f64, dy: f64) -> Vec<Point> {
+    translate_points_in_place(&mut points, dx, dy);
+    points
+}
+
+fn translate_points_in_place(points: &mut [Point], dx: f64, dy: f64) {
+    for point in points {
+        point.x += dx;
+        point.y += dy;
+    }
+}
+
+/// Join two compositional interface paths without selecting an expanded-graph
+/// route. Both endpoints are established by flat layouts; this only follows
+/// the proxy's empty margin with an orthogonal elbow.
+fn splice_points(points: &mut Vec<Point>, target: Point) {
+    let last = *points.last().unwrap();
+    if last.x != target.x && last.y != target.y {
+        points.push(Point {
+            x: target.x,
+            y: last.y,
+        });
+    }
+    points.push(target);
+}
+
+fn simplify_points(points: &mut Vec<Point>) {
+    let mut simplified = Vec::with_capacity(points.len());
+    for point in points.drain(..) {
+        if simplified.last() != Some(&point) {
+            simplified.push(point);
+        }
+    }
+    *points = simplified;
+}
+
+fn routes_clear_of_nodes<NodeId: Identifier, EdgeId: Identifier>(
+    nodes: &HashMap<NodeId, LayoutNode<NodeId>>,
+    edges: &HashMap<EdgeId, Vec<Point>>,
+) -> bool {
+    edges.values().all(|points| {
+        points.windows(2).all(|segment| {
+            nodes.values().all(|node| {
+                !crate::triskel::geometry::segment_enters_rect_strict(
+                    segment[0],
+                    segment[1],
+                    Point {
+                        x: node.x,
+                        y: node.y,
+                    },
+                    node.width,
+                    node.height,
+                )
+            })
+        })
+    })
 }
 
 fn node_bounds<NodeId: Identifier>(
@@ -771,292 +973,6 @@ where
     }
 
     ComponentLayout { nodes, edges }
-}
-
-fn insert_region_attachments<NodeId, EdgeId, NodeData, EdgeData>(
-    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
-    tree: &SeseTree<NodeId, EdgeId>,
-    boxes: &[RegionBox],
-    routes: &mut HashMap<EdgeId, Vec<Point>>,
-) where
-    NodeId: Identifier + Debug,
-    EdgeId: Identifier + Debug,
-{
-    for (edge_id, points) in routes.iter_mut() {
-        let edge = graph.get_edge(*edge_id).unwrap();
-        let from = edge.from_id();
-        let to = edge.to_id();
-        let relevant: Vec<_> = boxes
-            .iter()
-            .filter(|region_box| region_box.region != 0)
-            .filter(|region_box| {
-                let region = &tree.regions[region_box.region];
-                region.contained_nodes.contains(&from) != region.contained_nodes.contains(&to)
-            })
-            .copied()
-            .collect();
-        if relevant.is_empty() {
-            continue;
-        }
-        let mut expanded = Vec::new();
-        for pair in points.windows(2) {
-            expanded.push(pair[0]);
-            let mut hits = Vec::<(f64, Point)>::new();
-            for region_box in &relevant {
-                rectangle_boundary_hits(pair[0], pair[1], *region_box, &mut hits);
-            }
-            hits.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
-            hits.dedup_by(|lhs, rhs| {
-                (lhs.1.x - rhs.1.x).abs() < 1e-9 && (lhs.1.y - rhs.1.y).abs() < 1e-9
-            });
-            expanded.extend(hits.into_iter().map(|(_, point)| point));
-        }
-        if let Some(&last) = points.last() {
-            expanded.push(last);
-        }
-        *points = expanded;
-    }
-}
-
-fn rectangle_boundary_hits(a: Point, b: Point, rect: RegionBox, out: &mut Vec<(f64, Point)>) {
-    let dx = b.x - a.x;
-    let dy = b.y - a.y;
-    let mut add = |t: f64| {
-        if t > 1e-9 && t < 1.0 - 1e-9 {
-            let point = Point {
-                x: a.x + t * dx,
-                y: a.y + t * dy,
-            };
-            if point.x >= rect.min_x - 1e-9
-                && point.x <= rect.max_x + 1e-9
-                && point.y >= rect.min_y - 1e-9
-                && point.y <= rect.max_y + 1e-9
-            {
-                out.push((t, point));
-            }
-        }
-    };
-    if dx.abs() > 1e-12 {
-        add((rect.min_x - a.x) / dx);
-        add((rect.max_x - a.x) / dx);
-    }
-    if dy.abs() > 1e-12 {
-        add((rect.min_y - a.y) / dy);
-        add((rect.max_y - a.y) / dy);
-    }
-}
-
-fn route_composed_edges<NodeId, EdgeId, NodeData, EdgeData>(
-    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
-    component: &[NodeId],
-    nodes: &HashMap<NodeId, LayoutNode<NodeId>>,
-    settings: &LayoutSettings,
-) -> HashMap<EdgeId, Vec<Point>>
-where
-    NodeId: Identifier + Debug,
-    EdgeId: Identifier + Debug,
-{
-    let contained: HashSet<_> = component.iter().copied().collect();
-    let mut edge_ids: Vec<_> = graph.edges().map(|edge| edge.id()).collect();
-    edge_ids.sort_by_key(|id| Into::<usize>::into(*id));
-    let mut routes = HashMap::default();
-    let mut loop_counts = HashMap::<NodeId, u32>::default();
-    for &edge_id in &edge_ids {
-        let edge = graph.get_edge(edge_id).unwrap();
-        if edge.from_id() == edge.to_id() && contained.contains(&edge.from_id()) {
-            *loop_counts.entry(edge.from_id()).or_default() += 1;
-        }
-    }
-    let mut loop_index = HashMap::<NodeId, u32>::default();
-    for (lane, edge_id) in edge_ids.into_iter().enumerate() {
-        let edge = graph.get_edge(edge_id).unwrap();
-        let from = edge.from_id();
-        let to = edge.to_id();
-        if !contained.contains(&from) {
-            continue;
-        }
-        let source = nodes[&from];
-        if from == to {
-            let index = loop_index.entry(from).or_default();
-            routes.insert(
-                edge_id,
-                self_loop_waypoints(
-                    source.x,
-                    source.y,
-                    source.width,
-                    source.height,
-                    *index,
-                    loop_counts[&from],
-                ),
-            );
-            *index += 1;
-            continue;
-        }
-        let target = nodes[&to];
-        let occupied: Vec<_> = routes.values().cloned().collect();
-        routes.insert(
-            edge_id,
-            obstacle_route(nodes, source, target, lane, settings, &occupied),
-        );
-    }
-    routes
-}
-
-fn polylines_overlap(a: &[Point], b: &[Point]) -> bool {
-    const EPS: f64 = 1e-6;
-    a.windows(2).any(|lhs| {
-        b.windows(2).any(|rhs| {
-            let lhs_vertical = (lhs[0].x - lhs[1].x).abs() < EPS;
-            let rhs_vertical = (rhs[0].x - rhs[1].x).abs() < EPS;
-            if lhs_vertical && rhs_vertical && (lhs[0].x - rhs[0].x).abs() < EPS {
-                lhs[0].y.min(lhs[1].y).max(rhs[0].y.min(rhs[1].y)) + EPS
-                    < lhs[0].y.max(lhs[1].y).min(rhs[0].y.max(rhs[1].y))
-            } else if !lhs_vertical && !rhs_vertical && (lhs[0].y - rhs[0].y).abs() < EPS {
-                lhs[0].x.min(lhs[1].x).max(rhs[0].x.min(rhs[1].x)) + EPS
-                    < lhs[0].x.max(lhs[1].x).min(rhs[0].x.max(rhs[1].x))
-            } else {
-                false
-            }
-        })
-    })
-}
-
-fn obstacle_route<NodeId: Identifier>(
-    nodes: &HashMap<NodeId, LayoutNode<NodeId>>,
-    source: LayoutNode<NodeId>,
-    target: LayoutNode<NodeId>,
-    lane: usize,
-    settings: &LayoutSettings,
-    occupied: &[Vec<Point>],
-) -> Vec<Point> {
-    let offset = lane as f64 * 0.25;
-    // Deterministic face ports prevent incident edges from sharing their first
-    // or final segment. The quotient router only needs stable uniqueness here;
-    // the normal flat router uses its degree-aware fan assignment.
-    let port_fraction = (((lane % 29) + 1) as f64 / 30.0 - 0.5) * 0.8;
-    let anchors = |node: LayoutNode<NodeId>| {
-        [
-            Point {
-                x: node.x + node.width * port_fraction,
-                y: node.y - node.height / 2.0,
-            },
-            Point {
-                x: node.x + node.width / 2.0,
-                y: node.y + node.height * port_fraction,
-            },
-            Point {
-                x: node.x + node.width * port_fraction,
-                y: node.y + node.height / 2.0,
-            },
-            Point {
-                x: node.x - node.width / 2.0,
-                y: node.y + node.height * port_fraction,
-            },
-        ]
-    };
-    let source_anchors = anchors(source);
-    let target_anchors = anchors(target);
-    let clear = |a: Point, b: Point| {
-        nodes.values().all(|node| {
-            !crate::triskel::geometry::segment_enters_rect_strict(
-                a,
-                b,
-                Point {
-                    x: node.x,
-                    y: node.y,
-                },
-                node.width,
-                node.height,
-            )
-        })
-    };
-    if settings.edge_style == EdgeStyle::Straight {
-        let mut direct: Option<(f64, Vec<Point>)> = None;
-        for &a in &source_anchors {
-            for &b in &target_anchors {
-                let candidate = [a, b];
-                if clear(a, b)
-                    && !occupied
-                        .iter()
-                        .any(|route| polylines_overlap(&candidate, route))
-                {
-                    let length = (a.x - b.x).hypot(a.y - b.y);
-                    if direct.as_ref().is_none_or(|(old, _)| length < *old) {
-                        direct = Some((length, candidate.to_vec()));
-                    }
-                }
-            }
-        }
-        if let Some((_, points)) = direct {
-            return points;
-        }
-    }
-
-    let (min_x, max_x, min_y, max_y) = node_bounds(nodes);
-    // Region-boundary edges use edge-private exterior corridors. Besides
-    // avoiding every expanded child box, this prevents two independently
-    // expanded regions from selecting the same interior lane.
-    let xs = [
-        min_x - settings.node_gap - offset,
-        max_x + settings.node_gap + offset,
-    ];
-    let ys = [
-        min_y - settings.layer_gap - offset,
-        max_y + settings.layer_gap + offset,
-    ];
-    let mut best: Option<(f64, Vec<Point>)> = None;
-    for &a in &source_anchors {
-        for &b in &target_anchors {
-            for &x in &xs {
-                let candidate = [a, Point { x, y: a.y }, Point { x, y: b.y }, b];
-                if candidate.windows(2).all(|pair| clear(pair[0], pair[1]))
-                    && !occupied
-                        .iter()
-                        .any(|route| polylines_overlap(&candidate, route))
-                {
-                    let length: f64 = candidate
-                        .windows(2)
-                        .map(|pair| (pair[0].x - pair[1].x).abs() + (pair[0].y - pair[1].y).abs())
-                        .sum();
-                    if best.as_ref().is_none_or(|(old, _)| length < *old) {
-                        best = Some((length, candidate.to_vec()));
-                    }
-                }
-            }
-            for &y in &ys {
-                let candidate = [a, Point { x: a.x, y }, Point { x: b.x, y }, b];
-                if candidate.windows(2).all(|pair| clear(pair[0], pair[1]))
-                    && !occupied
-                        .iter()
-                        .any(|route| polylines_overlap(&candidate, route))
-                {
-                    let length: f64 = candidate
-                        .windows(2)
-                        .map(|pair| (pair[0].x - pair[1].x).abs() + (pair[0].y - pair[1].y).abs())
-                        .sum();
-                    if best.as_ref().is_none_or(|(old, _)| length < *old) {
-                        best = Some((length, candidate.to_vec()));
-                    }
-                }
-            }
-        }
-    }
-    let points = best.map(|(_, points)| points).unwrap_or_else(|| {
-        let x = max_x + settings.node_gap + offset;
-        vec![
-            source_anchors[1],
-            Point { x, y: source.y },
-            Point { x, y: target.y },
-            target_anchors[1],
-        ]
-    });
-    let mut simplified = Vec::new();
-    for point in points {
-        if simplified.last() != Some(&point) {
-            simplified.push(point);
-        }
-    }
-    simplified
 }
 
 /// Assigns each node a y by rank, using the tallest node in each rank so bends
@@ -1286,6 +1202,36 @@ mod tests {
     /// Rejects every edge intersection with a node that is not an endpoint of
     /// that edge. Endpoint interiors are checked separately because a route may
     /// validly begin/end on their boundaries.
+    fn assert_route_attaches_to_endpoints(
+        result: &LayoutResult<N, E>,
+        endpoints: &HashMap<E, (N, N)>,
+    ) {
+        let eps = 1e-6;
+        for (edge, points) in &result.edges {
+            let &(source, target) = endpoints.get(edge).expect("missing edge endpoint data");
+            for (point, node) in [
+                (points.first().unwrap(), result.nodes[&source]),
+                (points.last().unwrap(), result.nodes[&target]),
+            ] {
+                let on_vertical_face = (point.x - (node.x - node.width / 2.0)).abs() < eps
+                    || (point.x - (node.x + node.width / 2.0)).abs() < eps;
+                let on_horizontal_face = (point.y - (node.y - node.height / 2.0)).abs() < eps
+                    || (point.y - (node.y + node.height / 2.0)).abs() < eps;
+                assert!(
+                    (on_vertical_face
+                        && point.y >= node.y - node.height / 2.0 - eps
+                        && point.y <= node.y + node.height / 2.0 + eps)
+                        || (on_horizontal_face
+                            && point.x >= node.x - node.width / 2.0 - eps
+                            && point.x <= node.x + node.width / 2.0 + eps),
+                    "edge {} does not attach to node {}: {point:?} vs {node:?}",
+                    usize::from(*edge),
+                    usize::from(node.id),
+                );
+            }
+        }
+    }
+
     fn assert_no_edge_through_nonincident_node(
         result: &LayoutResult<N, E>,
         endpoints: &HashMap<E, (N, N)>,
@@ -1911,6 +1857,7 @@ mod tests {
         assert_eq!(first.edges.len(), endpoints.len());
         assert_no_node_overlap(&first);
         assert_no_edge_through_nonincident_node(&first, &endpoints);
+        assert_route_attaches_to_endpoints(&first, &endpoints);
         for points in first.edges.values() {
             assert!(points.len() >= 2);
             assert!(points.windows(2).all(|pair| {
@@ -1933,6 +1880,43 @@ mod tests {
                 }))
         );
         assert_no_edge_through_nonincident_node(&straight, &endpoints);
+    }
+
+    #[test]
+    fn sese_parallel_boundary_edges_keep_flat_router_ports() {
+        // More than the former 29-port cap: these must keep the ordinary flat
+        // router's degree-aware fan, not be sent through a bespoke SESE lane
+        // allocator that reuses port positions.
+        let mut graph = G::default();
+        let s = graph.make_node(());
+        let a = graph.make_node(());
+        let b = graph.make_node(());
+        let c = graph.make_node(());
+        let d = graph.make_node(());
+        let t = graph.make_node(());
+        let mut endpoints = HashMap::default();
+        let record = |graph: &mut G, from, to, endpoints: &mut HashMap<E, (N, N)>| {
+            let edge = graph.make_edge(from, to, ());
+            endpoints.insert(edge, (from, to));
+        };
+        record(&mut graph, s, a, &mut endpoints);
+        for _ in 0..35 {
+            record(&mut graph, a, b, &mut endpoints);
+        }
+        record(&mut graph, a, c, &mut endpoints);
+        record(&mut graph, b, d, &mut endpoints);
+        record(&mut graph, c, d, &mut endpoints);
+        record(&mut graph, d, t, &mut endpoints);
+
+        let result = LayoutBuilder::new(&graph)
+            .root(s)
+            .mode(LayoutMode::Sese)
+            .build()
+            .unwrap();
+        assert_route_attaches_to_endpoints(&result, &endpoints);
+        assert_no_edge_through_nonincident_node(&result, &endpoints);
+        assert_no_horizontal_overlap(&result);
+        assert_no_vertical_overlap(&result);
     }
 
     #[test]
