@@ -447,9 +447,11 @@ fn jpp_cycle_classes<E: Copy>(input: &[IEdge<E>], n: usize, root: usize) -> Vec<
             brackets[node].push(eid);
         }
         if let Some(parent_eid) = parent_edge[node] {
-            let &top = brackets[node]
-                .last()
-                .expect("non-root DFS vertex must have a bracket");
+            let Some(&top) = brackets[node].last() else {
+                // Not a proper flowgraph (typically a non-terminating sink
+                // SCC). The defining predicate remains exact for this case.
+                return direct_cycle_classes(input, n);
+            };
             if recent_size[top] != brackets[node].len() {
                 recent_size[top] = brackets[node].len();
                 recent_class[top] = next_class;
@@ -474,7 +476,11 @@ fn jpp_cycle_classes<E: Copy>(input: &[IEdge<E>], n: usize, root: usize) -> Vec<
         return classes;
     }
 
-    let mut parent: Vec<_> = (0..input.len()).collect();
+    direct_cycle_classes(input, n)
+}
+
+fn direct_cycle_classes<E: Copy>(edges: &[IEdge<E>], n: usize) -> Vec<usize> {
+    let mut parent: Vec<_> = (0..edges.len()).collect();
     fn find(parent: &mut [usize], mut node: usize) -> usize {
         while parent[node] != node {
             parent[node] = parent[parent[node]];
@@ -482,9 +488,9 @@ fn jpp_cycle_classes<E: Copy>(input: &[IEdge<E>], n: usize, root: usize) -> Vec<
         }
         node
     }
-    for a in 0..input.len() {
-        for b in (a + 1)..input.len() {
-            if cycle_equivalent(input, n, a, b) {
+    for a in 0..edges.len() {
+        for b in (a + 1)..edges.len() {
+            if cycle_equivalent(edges, n, a, b) {
                 let ra = find(&mut parent, a);
                 let rb = find(&mut parent, b);
                 parent[rb] = ra;
@@ -493,7 +499,7 @@ fn jpp_cycle_classes<E: Copy>(input: &[IEdge<E>], n: usize, root: usize) -> Vec<
     }
     let mut labels = HashMap::default();
     let mut next = 1usize;
-    (0..input.len())
+    (0..edges.len())
         .map(|edge| {
             let root = find(&mut parent, edge);
             *labels.entry(root).or_insert_with(|| {
