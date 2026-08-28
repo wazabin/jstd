@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::{
     graph::{
         Graph, GraphMut,
-        analysis::{SeseTree, compute_sese},
+        analysis::{SeseRegion, SeseTree, compute_sese},
         edge::Edge,
         node::Node,
         owning::OwningGraph,
@@ -411,6 +411,142 @@ struct ComponentLayout<NodeId: Identifier, EdgeId: Identifier> {
     edges: HashMap<EdgeId, Vec<Point>>,
 }
 
+/// Compute SESE regions on a CFG normalized into one explicit hammock: an
+/// analysis-only source enters the selected root and all natural exits enter
+/// an analysis-only sink.  The synthetic boundaries establish the outer
+/// hammock without leaking fake nodes or edges into the composition tree.
+fn compute_sese_normalized<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    component: &[NodeId],
+    root: NodeId,
+) -> SeseTree<NodeId, EdgeId>
+where
+    NodeId: Identifier + Debug + Ord,
+    EdgeId: Identifier + Debug + Ord,
+{
+    let mut augmented = OwningGraph::<usize, usize, (), ()>::default();
+    let super_entry = augmented.make_node(());
+    let super_exit = augmented.make_node(());
+    let mut augmented_node = HashMap::default();
+    let mut original_node = HashMap::default();
+    for &node in component {
+        let augmented_id = augmented.make_node(());
+        augmented_node.insert(node, augmented_id);
+        original_node.insert(augmented_id, node);
+    }
+    augmented.make_edge(super_entry, augmented_node[&root], ());
+
+    let component_set: HashSet<_> = component.iter().copied().collect();
+    let mut has_real_out = HashMap::<NodeId, bool>::default();
+    for &node in component {
+        has_real_out.insert(node, false);
+    }
+    let mut original_edge = HashMap::default();
+    let mut edge_ids: Vec<_> = graph.edges().map(|edge| edge.id()).collect();
+    edge_ids.sort();
+    for edge_id in edge_ids {
+        let edge = graph.get_edge(edge_id).unwrap();
+        let from = edge.from_id();
+        let to = edge.to_id();
+        if !component_set.contains(&from) || !component_set.contains(&to) {
+            continue;
+        }
+        let augmented_id = augmented.make_edge(augmented_node[&from], augmented_node[&to], ());
+        original_edge.insert(augmented_id, edge_id);
+        if from != to {
+            has_real_out.insert(from, true);
+        }
+    }
+    let exits: Vec<_> = component
+        .iter()
+        .copied()
+        .filter(|node| !has_real_out[node])
+        .collect();
+    if exits.is_empty() {
+        // Match compute_sese's deterministic normalization for a closed CFG.
+        augmented.make_edge(augmented_node[component.last().unwrap()], super_exit, ());
+    } else {
+        for node in exits {
+            augmented.make_edge(augmented_node[&node], super_exit, ());
+        }
+    }
+
+    let raw = compute_sese(&augmented, super_entry);
+    let mut old_to_new = vec![None; raw.regions.len()];
+    old_to_new[0] = Some(0);
+    let mut regions = vec![SeseRegion {
+        parent: None,
+        children: Vec::new(),
+        entry_edge: None,
+        exit_edge: None,
+        nodes: Vec::new(),
+        contained_nodes: component.to_vec(),
+    }];
+    for (old, region) in raw.regions.iter().enumerate().skip(1) {
+        let Some(entry) = region
+            .entry_edge
+            .and_then(|edge| original_edge.get(&edge))
+            .copied()
+        else {
+            continue;
+        };
+        let Some(exit) = region
+            .exit_edge
+            .and_then(|edge| original_edge.get(&edge))
+            .copied()
+        else {
+            continue;
+        };
+        let Some(contained_nodes) = region
+            .contained_nodes
+            .iter()
+            .map(|node| original_node.get(node).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if contained_nodes.is_empty() {
+            continue;
+        }
+        let new = regions.len();
+        old_to_new[old] = Some(new);
+        regions.push(SeseRegion {
+            parent: None,
+            children: Vec::new(),
+            entry_edge: Some(entry),
+            exit_edge: Some(exit),
+            nodes: Vec::new(),
+            contained_nodes,
+        });
+    }
+    for old in 1..raw.regions.len() {
+        let Some(new) = old_to_new[old] else {
+            continue;
+        };
+        let mut parent = raw.regions[old].parent;
+        while let Some(old_parent) = parent {
+            if let Some(new_parent) = old_to_new[old_parent] {
+                regions[new].parent = Some(new_parent);
+                regions[new_parent].children.push(new);
+                break;
+            }
+            parent = raw.regions[old_parent].parent;
+        }
+    }
+    for &node in component {
+        let owner = regions
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, region)| region.contained_nodes.contains(&node))
+            .min_by_key(|(_, region)| region.contained_nodes.len())
+            .map(|(id, _)| id)
+            .unwrap_or(0);
+        regions[owner].nodes.push(node);
+    }
+    SeseTree { regions }
+}
+
 fn layout_component_sese<NodeId, EdgeId, NodeData, EdgeData>(
     graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
     component: &[NodeId],
@@ -426,7 +562,7 @@ where
     let root = preferred_root
         .filter(|root| component_set.contains(root))
         .unwrap_or_else(|| *component.iter().min().unwrap());
-    let tree = compute_sese(graph, root);
+    let tree = compute_sese_normalized(graph, component, root);
     let useful_region = tree
         .regions
         .iter()
@@ -441,7 +577,9 @@ where
     // proxy's reserved margin.  Do not resurrect the old expanded-graph router
     // to repair a bad splice: retain the flat layout's safety guarantee by
     // falling back for that component instead.
-    if !routes_clear_of_nodes(&composition.nodes, &composition.edges) {
+    if !routes_clear_of_nodes(&composition.nodes, &composition.edges)
+        || !routes_are_deconflicted(&composition.edges)
+    {
         return layout_component(graph, component, geometry, preferred_root, settings);
     }
     let RegionComposition {
@@ -831,6 +969,37 @@ fn routes_clear_of_nodes<NodeId: Identifier, EdgeId: Identifier>(
                     node.height,
                 )
             })
+        })
+    })
+}
+
+fn routes_are_deconflicted<EdgeId: Identifier>(edges: &HashMap<EdgeId, Vec<Point>>) -> bool {
+    let routes: Vec<_> = edges.values().collect();
+    for (index, route) in routes.iter().enumerate() {
+        for other in routes.iter().skip(index + 1) {
+            if routes_have_collinear_overlap(route, other) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn routes_have_collinear_overlap(a: &[Point], b: &[Point]) -> bool {
+    const EPS: f64 = 1e-6;
+    a.windows(2).any(|lhs| {
+        b.windows(2).any(|rhs| {
+            let lhs_vertical = (lhs[0].x - lhs[1].x).abs() < EPS;
+            let rhs_vertical = (rhs[0].x - rhs[1].x).abs() < EPS;
+            if lhs_vertical && rhs_vertical && (lhs[0].x - rhs[0].x).abs() < EPS {
+                lhs[0].y.min(lhs[1].y).max(rhs[0].y.min(rhs[1].y)) + EPS
+                    < lhs[0].y.max(lhs[1].y).min(rhs[0].y.max(rhs[1].y))
+            } else if !lhs_vertical && !rhs_vertical && (lhs[0].y - rhs[0].y).abs() < EPS {
+                lhs[0].x.min(lhs[1].x).max(rhs[0].x.min(rhs[1].x)) + EPS
+                    < lhs[0].x.max(lhs[1].x).min(rhs[0].x.max(rhs[1].x))
+            } else {
+                false
+            }
         })
     })
 }
@@ -1880,6 +2049,32 @@ mod tests {
                 }))
         );
         assert_no_edge_through_nonincident_node(&straight, &endpoints);
+    }
+
+    #[test]
+    fn sese_normalization_keeps_virtual_hammock_terminals_internal() {
+        let mut graph = G::default();
+        let entry = graph.make_node(());
+        let left = graph.make_node(());
+        let right = graph.make_node(());
+        graph.make_edge(entry, left, ());
+        graph.make_edge(entry, right, ());
+        let component = vec![entry, left, right];
+        let tree = compute_sese_normalized(&graph, &component, entry);
+        assert_eq!(tree.root().contained_nodes, component);
+        let mut owned: Vec<_> = tree
+            .regions
+            .iter()
+            .flat_map(|region| region.nodes.iter().copied())
+            .collect();
+        owned.sort();
+        assert_eq!(owned, vec![entry, left, right]);
+        assert!(tree.regions.iter().all(|region| {
+            region
+                .contained_nodes
+                .iter()
+                .all(|node| [entry, left, right].contains(node))
+        }));
     }
 
     #[test]
