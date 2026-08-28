@@ -15,7 +15,7 @@ use jstd::{
     Identifier,
     graph::owning::OwningGraph,
     triskel::{
-        layout::{LayoutBuilder, NodeGeometry},
+        layout::{LayoutBuilder, LayoutMode, NodeGeometry},
         router::EdgeStyle,
     },
 };
@@ -91,6 +91,20 @@ fn bench_graph(c: &mut Criterion, name: &str, graph: &(Graph, NodeId), style: Ed
         })
     });
 }
+fn bench_sese_graph(c: &mut Criterion, name: &str, graph: &(Graph, NodeId)) {
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            black_box(
+                LayoutBuilder::new(&graph.0)
+                    .root(graph.1)
+                    .mode(LayoutMode::Sese)
+                    .max_sweeps(4)
+                    .build()
+                    .unwrap(),
+            )
+        })
+    });
+}
 fn suites(c: &mut Criterion) {
     let mut group = c.benchmark_group("triskel_layout");
     for span in [8usize, 32, 64] {
@@ -108,6 +122,7 @@ fn suites(c: &mut Criterion) {
         });
     }
     group.finish();
+    bench_sese_graph(c, "sese_nested_regions", &chain_with_spans(32, 14));
     for (name, graph, style) in [
         (
             "wide_bipartite",
