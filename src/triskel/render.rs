@@ -171,7 +171,11 @@ mod tests {
             vec![Point { x: -10.0, y: 0.0 }, Point { x: 50.0, y: 20.0 }],
         );
         edges.insert(4, vec![Point { x: 0.0, y: 0.0 }]); // ignored: not a path
-        let layout = LayoutResult { nodes, edges };
+        let layout = LayoutResult {
+            nodes,
+            edges,
+            regions: Vec::new(),
+        };
 
         let svg = render_svg_with_labels(&layout, |id| {
             (if id == 1 { "<&>\"'" } else { "second\nline" }).into()
@@ -195,6 +199,7 @@ mod tests {
         let layout = LayoutResult::<usize, usize> {
             nodes: HashMap::default(),
             edges: HashMap::default(),
+            regions: Vec::new(),
         };
         let svg = render_svg(&layout);
         assert!(svg.contains("width=\"240\" height=\"180\""));

@@ -10,6 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 rustc-hash = "2"
+image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
 criterion = "0.5"
@@ -24,6 +25,7 @@ description = "Typed identifiers, graphs, registries, and string interning"
 readme = "README.md"
 
 [dependencies]
+image.workspace = true
 # Fast non-cryptographic hasher for internal int-keyed maps; deterministic
 # iteration order (std RandomState reseeds per process).
 rustc-hash.workspace = true

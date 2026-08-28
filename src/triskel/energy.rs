@@ -384,7 +384,11 @@ where
             })
             .collect();
 
-        Ok(LayoutResult { nodes, edges })
+        Ok(LayoutResult {
+            nodes,
+            edges,
+            regions: Vec::new(),
+        })
     }
 }
 

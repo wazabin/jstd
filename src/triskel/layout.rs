@@ -170,6 +170,19 @@ pub struct LayoutNode<NodeId: Identifier> {
 pub struct LayoutResult<NodeId: Identifier, EdgeId: Identifier> {
     pub nodes: HashMap<NodeId, LayoutNode<NodeId>>,
     pub edges: HashMap<EdgeId, Vec<Point>>,
+    /// Analysis-only SESE proxy bounds, populated in [`LayoutMode::Sese`].
+    /// They are useful for debug renderers and are empty for flat layout.
+    pub regions: Vec<LayoutRegion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutRegion {
+    pub id: usize,
+    pub parent: Option<usize>,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 impl<NodeId: Identifier, EdgeId: Identifier> LayoutResult<NodeId, EdgeId> {
@@ -359,6 +372,7 @@ where
 
         let mut nodes = HashMap::default();
         let mut edges = HashMap::default();
+        let mut regions = Vec::new();
         let mut x_offset = 0.0f64;
 
         for component in components {
@@ -384,6 +398,16 @@ where
                 node.y += shift_y;
                 nodes.insert(id, node);
             }
+            let region_base = regions.len();
+            for region in local.regions {
+                regions.push(LayoutRegion {
+                    id: region_base + region.id,
+                    parent: region.parent.map(|parent| region_base + parent),
+                    x: region.x + shift_x,
+                    y: region.y + shift_y,
+                    ..region
+                });
+            }
             for (id, points) in local.edges {
                 edges.insert(
                     id,
@@ -400,7 +424,11 @@ where
             x_offset += (max_x - min_x) + self.settings.node_gap;
         }
 
-        Ok(LayoutResult { nodes, edges })
+        Ok(LayoutResult {
+            nodes,
+            edges,
+            regions,
+        })
     }
 }
 
@@ -409,6 +437,7 @@ where
 struct ComponentLayout<NodeId: Identifier, EdgeId: Identifier> {
     nodes: HashMap<NodeId, LayoutNode<NodeId>>,
     edges: HashMap<EdgeId, Vec<Point>>,
+    regions: Vec<LayoutRegion>,
 }
 
 /// Compute SESE regions on a CFG normalized into one explicit hammock: an
@@ -583,7 +612,10 @@ where
         return layout_component(graph, component, geometry, preferred_root, settings);
     }
     let RegionComposition {
-        mut nodes, edges, ..
+        mut nodes,
+        edges,
+        mut region_boxes,
+        ..
     } = composition;
     // Keep the component centred around its own bounds; the public packer will
     // apply the final top/left translation.
@@ -594,6 +626,17 @@ where
         node.x += dx;
         node.y += dy;
     }
+    let regions = region_boxes
+        .drain(..)
+        .map(|region| LayoutRegion {
+            id: region.id,
+            parent: region.parent,
+            x: (region.min_x + region.max_x) / 2.0 + dx,
+            y: (region.min_y + region.max_y) / 2.0 + dy,
+            width: region.max_x - region.min_x,
+            height: region.max_y - region.min_y,
+        })
+        .collect();
     let edges = edges
         .into_iter()
         .map(|(id, points)| {
@@ -609,7 +652,21 @@ where
             )
         })
         .collect();
-    ComponentLayout { nodes, edges }
+    ComponentLayout {
+        nodes,
+        edges,
+        regions,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RegionBox {
+    id: usize,
+    parent: Option<usize>,
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
 }
 
 struct RegionComposition<NodeId: Identifier, EdgeId: Identifier> {
@@ -622,6 +679,7 @@ struct RegionComposition<NodeId: Identifier, EdgeId: Identifier> {
     /// quotient edge when this region is expanded, but never exposed as edges.
     entry_interface: Option<Vec<Point>>,
     exit_interface: Option<Vec<Point>>,
+    region_boxes: Vec<RegionBox>,
     width: f64,
     height: f64,
 }
@@ -785,6 +843,7 @@ where
         );
     }
     let mut edges = HashMap::default();
+    let mut region_boxes = Vec::new();
     let mut child_interfaces = HashMap::default();
     for (child_id, mut child) in children {
         let proxy = quotient_layout.nodes[&proxy_entity[&child_id]];
@@ -795,6 +854,13 @@ where
         }
         for (edge_id, points) in child.edges.drain() {
             edges.insert(edge_id, translate_points(points, proxy.x, proxy.y));
+        }
+        for mut region_box in child.region_boxes.drain(..) {
+            region_box.min_x += proxy.x;
+            region_box.max_x += proxy.x;
+            region_box.min_y += proxy.y;
+            region_box.max_y += proxy.y;
+            region_boxes.push(region_box);
         }
         child_interfaces.insert(
             proxy_entity[&child_id],
@@ -899,6 +965,20 @@ where
     for points in edges.values_mut() {
         translate_points_in_place(points, -center_x, -center_y);
     }
+    for region_box in &mut region_boxes {
+        region_box.min_x -= center_x;
+        region_box.max_x -= center_x;
+        region_box.min_y -= center_y;
+        region_box.max_y -= center_y;
+    }
+    region_boxes.push(RegionBox {
+        id: region_id,
+        parent: region.parent,
+        min_x: min_x - center_x - settings.node_gap / 2.0,
+        max_x: max_x - center_x + settings.node_gap / 2.0,
+        min_y: min_y - center_y - settings.layer_gap / 2.0,
+        max_y: max_y - center_y + settings.layer_gap / 2.0,
+    });
     if let Some(points) = &mut entry_interface {
         translate_points_in_place(points, -center_x, -center_y);
     }
@@ -910,6 +990,7 @@ where
         edges,
         entry_interface,
         exit_interface,
+        region_boxes,
         width: max_x - min_x,
         height: max_y - min_y,
     }
@@ -1141,7 +1222,11 @@ where
         edges.insert(edge_id, points);
     }
 
-    ComponentLayout { nodes, edges }
+    ComponentLayout {
+        nodes,
+        edges,
+        regions: Vec::new(),
+    }
 }
 
 /// Assigns each node a y by rank, using the tallest node in each rank so bends
@@ -1365,7 +1450,11 @@ mod tests {
                 Point { x: 20.0, y: 0.0 },
             ],
         );
-        assert_no_edge_through_node(&LayoutResult { nodes, edges });
+        assert_no_edge_through_node(&LayoutResult {
+            nodes,
+            edges,
+            regions: Vec::new(),
+        });
     }
 
     /// Rejects every edge intersection with a node that is not an endpoint of
@@ -2024,6 +2113,10 @@ mod tests {
         assert_eq!(signature(&first), signature(&second));
         assert_eq!(first.nodes.len(), nodes.len());
         assert_eq!(first.edges.len(), endpoints.len());
+        assert!(
+            !first.regions.is_empty(),
+            "SESE debug regions should be retained"
+        );
         assert_no_node_overlap(&first);
         assert_no_edge_through_nonincident_node(&first, &endpoints);
         assert_route_attaches_to_endpoints(&first, &endpoints);
