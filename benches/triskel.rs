@@ -44,6 +44,22 @@ fn chain_with_spans(span: usize, spans: usize) -> (Graph, NodeId) {
     }
     finish(graph, nodes[0])
 }
+/// A fan with a central blocker: outer edges stay direct in `Straight` mode,
+/// while the blocked diagonal routes through the shared orthogonal lanes.
+fn mixed_straight_fallback(width: usize) -> (Graph, NodeId) {
+    let mut graph = Graph::default();
+    let root = graph.make_node(());
+    let blocker = graph.make_node(());
+    let bottom: Vec<_> = (0..width).map(|_| graph.make_node(())).collect();
+    for &node in &bottom {
+        graph.make_edge(root, node, ());
+    }
+    // Force a second rank and put a real box in the fan's path.
+    for &node in &bottom {
+        graph.make_edge(blocker, node, ());
+    }
+    finish(graph, root)
+}
 fn bipartite(width: usize, dense: bool) -> (Graph, NodeId) {
     let mut graph = Graph::default();
     let top: Vec<_> = (0..width).map(|_| graph.make_node(())).collect();
@@ -118,6 +134,11 @@ fn suites(c: &mut Criterion) {
             "orthogonal_lane_contention",
             bipartite(14, true),
             EdgeStyle::Orthogonal,
+        ),
+        (
+            "mixed_straight_fallback",
+            mixed_straight_fallback(14),
+            EdgeStyle::Straight,
         ),
     ] {
         bench_graph(c, name, &graph, style);
