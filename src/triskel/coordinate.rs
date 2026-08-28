@@ -666,10 +666,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ordering_output_always_admits_mandatory_segment_constraints() {
-        // Two simultaneous/nested spans plus a cycle (the caller's cycle phase
-        // has already made it a back-edge gadget in normal layout) exercise the
-        // exact ordering→coordinate phase boundary with varied widths.
+    fn fixed_ordering_output_admits_mandatory_segment_constraints() {
+        // A focused unit fixture.  Generated real-pipeline coverage lives in
+        // layout::tests::generated_segmented_layouts_preserve_phase_and_route_invariants.
         let mut graph = LayoutGraph::default();
         let nodes: Vec<_> = (0..6)
             .map(|i| {

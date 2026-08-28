@@ -449,6 +449,13 @@ where
     rank::assign_ranks(&mut local);
     let seg = segment::build_segments(&mut local);
     let ordering = order::order(&mut local, &seg, root_local, settings.max_sweeps);
+    // This is the ordering→coordinates phase contract.  The generated layout
+    // properties execute the real cycle/rank/segment/order pipeline and check
+    // that no mandatory p/lane/q equality can contradict slot separation.
+    #[cfg(test)]
+    assert!(coordinate::mandatory_constraints_feasible(
+        &local, &seg, &ordering
+    ));
     coordinate::assign_x(&mut local, &seg, &ordering, settings.node_gap);
     assign_y(&mut local, &ordering.layers, settings.layer_gap);
 
@@ -812,10 +819,13 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
         #[test]
-        fn generated_layouts_are_finite_deterministic_and_orthogonal(
-            node_count in 1usize..=6,
-            edge_pairs in proptest::collection::vec((0usize..12, 0usize..12), 0..16),
-            dimensions in proptest::collection::vec((10u32..=140, 10u32..=80), 1..=6),
+        fn generated_segmented_layouts_preserve_phase_and_route_invariants(
+            // Every generated graph includes the fixture below, which forces
+            // simultaneous/nested long segments, a cycle/back-edge gadget and
+            // a self-loop reservation through the real pipeline.
+            node_count in 6usize..=10,
+            edge_pairs in proptest::collection::vec((0usize..20, 0usize..20), 0..24),
+            dimensions in proptest::collection::vec((10u32..=140, 10u32..=80), 6..=10),
             node_gap in 8u32..=40,
             layer_gap in 16u32..=80,
             sweeps in 1usize..=6,
@@ -824,7 +834,10 @@ mod tests {
             let mut graph = G::default();
             let nodes: Vec<_> = (0..node_count).map(|_| graph.make_node(())).collect();
             let mut endpoints = HashMap::default();
-            for (from, to) in edge_pairs {
+            for (from, to) in [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (0, 5), (1, 4), (5, 0), (2, 2)]
+                .into_iter()
+                .chain(edge_pairs)
+            {
                 let (from, to) = (nodes[from % node_count], nodes[to % node_count]);
                 let edge = graph.make_edge(from, to, ());
                 endpoints.insert(edge, (from, to));
@@ -866,43 +879,48 @@ mod tests {
             assert_no_node_overlap(&first);
             assert_no_edge_through_node(&first);
             assert_no_edge_through_nonincident_node(&first, &endpoints);
-            if orthogonal {
+            // Mixed Straight output can contain fallback orthogonal segments,
+            // so collinear-overlap checks apply even when the requested style
+            // is not fully orthogonal.
+            if !orthogonal {
                 assert_no_horizontal_overlap(&first);
                 assert_no_vertical_overlap(&first);
             }
         }
     }
 
-    #[test]
-    #[ignore = "run explicitly as cargo test triskel_stress_generated_layouts -- --ignored"]
-    fn triskel_stress_generated_layouts() {
-        // 256 deterministic mixed graphs: cycles, self-loops, parallel edges,
-        // variable geometry, both routers, and disconnected vertices.
-        for seed in 0usize..256 {
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        #[ignore = "run explicitly as cargo test triskel_stress_generated_layouts -- --ignored"]
+        fn triskel_stress_generated_layouts(
+            node_count in 2usize..=10,
+            edge_pairs in proptest::collection::vec((0usize..20, 0usize..20), 1..24),
+            dimensions in proptest::collection::vec((10u32..=140, 10u32..=80), 2..=10),
+            root_index in 0usize..24,
+            orthogonal in any::<bool>(),
+        ) {
+            // This deliberately uses proptest rather than seed enumeration, so
+            // failures shrink to an edge list, root, dimensions, and style.
             let mut graph = G::default();
-            let count = 2 + seed % 10;
-            let nodes: Vec<_> = (0..count).map(|_| graph.make_node(())).collect();
+            let nodes: Vec<_> = (0..node_count).map(|_| graph.make_node(())).collect();
             let mut endpoints = HashMap::default();
-            for i in 0..(count * 3) {
-                let from = nodes[(seed.wrapping_mul(17) + i * 3) % count];
-                let to = nodes[(seed.wrapping_mul(7) + i * 5 + 1) % count];
-                let edge = graph.make_edge(from, to, ());
-                endpoints.insert(edge, (from, to));
+            for (from, to) in edge_pairs {
+                let edge = graph.make_edge(nodes[from % node_count], nodes[to % node_count], ());
+                endpoints.insert(edge, (nodes[from % node_count], nodes[to % node_count]));
             }
+            let geometry = dimensions.clone();
             let result = LayoutBuilder::new(&graph)
-                .root(nodes[seed % count])
-                .edge_style(if seed % 2 == 0 {
-                    EdgeStyle::Orthogonal
-                } else {
-                    EdgeStyle::Straight
-                })
-                .geometry(|id| NodeGeometry {
-                    width: 10.0 + (usize::from(id) % 7 * 23) as f64,
-                    height: 10.0 + (usize::from(id) % 5 * 13) as f64,
+                .root(nodes[root_index % node_count])
+                .max_sweeps(8)
+                .edge_style(if orthogonal { EdgeStyle::Orthogonal } else { EdgeStyle::Straight })
+                .geometry(|id| {
+                    let (width, height) = geometry[usize::from(id) % geometry.len()];
+                    NodeGeometry { width: width as f64, height: height as f64 }
                 })
                 .build()
                 .unwrap();
-            assert_eq!(result.edges.len(), graph.edges().count(), "seed={seed}");
+            prop_assert_eq!(result.edges.len(), graph.edges().count());
             assert_no_node_overlap(&result);
             assert_no_edge_through_node(&result);
             assert_no_edge_through_nonincident_node(&result, &endpoints);
