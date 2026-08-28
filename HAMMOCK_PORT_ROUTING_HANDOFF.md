@@ -226,6 +226,59 @@ cargo fmt --check
 cargo run --bin triskel-png -- examples/graphs/hammoc.dot output.png --sese --debug
 ```
 
+## Follow-up: compose maximal SESE regions inside hammocks
+
+The expected structured hierarchy for `hammoc.dot` is four regions:
+
+```text
+root graph
+└── node hammock: b,c,d,e,f
+    ├── edge-SESE: c,d   (entry b -> c, exit d -> end)
+    └── edge-SESE: e,f   (entry b -> e, exit f -> end)
+```
+
+This is intentionally **not** the current behaviour. `compute_sese` chooses
+canonical atomic regions by retaining the *smallest* candidate for each
+boundary edge. It therefore returns singleton regions `c`, `d`, `e`, and `f`
+rather than the useful pairs. `layout_component_sese` then replaces that
+singleton-only tree wholesale with `compute_hammock_fallback`, whose greedy
+maximal-node selection returns only `b,c,d,e,f`. Consequently the debug layout
+shows the root and hammock but not `(c,d)` or `(e,f)`.
+
+Implement a layout-specific region-tree builder that **merges**, rather than
+chooses between, these two analyses:
+
+1. Preserve the existing public/canonical `compute_sese` semantics. Do not
+   change its smallest-boundary rule merely to serve layout.
+2. Add an internal way to enumerate the raw valid edge-SESE candidates before
+   `compute_sese` applies `smallest_for_boundary`. Reuse its actual criteria:
+   entry-edge dominance, exit-edge post-dominance, nonzero equal JPP
+   cycle-equivalence class, and `region_nodes`. Normalize synthetic entry/exit
+   boundaries exactly as `compute_sese_normalized` already does; discard any
+   candidate whose boundary or contained node is synthetic.
+3. Build the maximal node-hammock candidates as today. Select maximal,
+   nontrivial edge-SESE candidates (`contained_nodes.len() > 1`) that are
+   strict subsets of a selected hammock. For the fixture this must select
+   exactly `{c,d}` and `{e,f}`. Selection must be deterministic, laminar, and
+   must not select crossing/overlapping siblings. Prefer larger candidates
+   under containment; preserve legitimate nested SESE candidates as children.
+4. Construct one `SeseTree` with the root graph as region 0, each selected
+   hammock as its child, and the selected SESE candidates nested under the
+   smallest containing hammock/SESE region. Assign each original node once to
+   its deepest owner. Keep boundary edges on each region so
+   `compose_sese_region` can create its interfaces.
+5. Use this merged tree in `layout_component_sese`. Hammock fallback must no
+   longer discard useful canonical/edge-SESE structure. It remains appropriate
+   for subgraphs that have no useful edge-SESE candidates.
+6. Extend `hammock_fallback_groups_multiple_exit_edges_to_one_exit_node` (or a
+   focused companion test) to assert the exact four-region hierarchy above,
+   including parent ids and contained node sets. Render the fixture with
+   `triskel-png --sese --debug` and verify both `(c,d)` and `(e,f)` rectangles
+   appear inside the hammock rectangle.
+7. Re-run all port-composition invariants for this nested mixed hierarchy:
+   `b -> c`, `b -> e`, `d -> end`, and `f -> end` must use exact named-port
+   joins; the two hammock exit ports remain distinct.
+
 ## Scope cautions
 
 - Do not reintroduce a global obstacle router for expanded original edges.
