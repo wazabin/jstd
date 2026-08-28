@@ -18,4 +18,5 @@ pub mod sese;
 
 pub use dominator::{DominatorTree, compute_dominators, reachable_from_root};
 pub use post_dominator::compute_postdominators;
+pub(crate) use sese::compute_sese_candidates;
 pub use sese::{SeseRegion, SeseTree, compute_sese};

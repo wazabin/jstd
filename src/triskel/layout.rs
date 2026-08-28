@@ -17,7 +17,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::{
     graph::{
         Graph, GraphMut,
-        analysis::{SeseRegion, SeseTree, compute_sese},
+        analysis::{SeseRegion, SeseTree, compute_sese, compute_sese_candidates},
         edge::Edge,
         node::Node,
         owning::OwningGraph,
@@ -466,6 +466,79 @@ struct ComponentLayout<NodeId: Identifier, EdgeId: Identifier> {
     regions: Vec<LayoutRegion>,
 }
 
+/// Enumerate raw edge-SESE candidates on the same explicitly normalized CFG
+/// used by [`compute_sese_normalized`]. Synthetic boundaries and nodes are
+/// discarded before layout sees the candidate.
+fn compute_sese_candidates_normalized<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    component: &[NodeId],
+    root: NodeId,
+) -> Vec<(Vec<NodeId>, EdgeId, EdgeId)>
+where
+    NodeId: Identifier + Debug + Ord,
+    EdgeId: Identifier + Debug + Ord,
+{
+    let mut augmented = OwningGraph::<usize, usize, (), ()>::default();
+    let super_entry = augmented.make_node(());
+    let super_exit = augmented.make_node(());
+    let mut augmented_node = HashMap::default();
+    let mut original_node = HashMap::default();
+    for &node in component {
+        let augmented_id = augmented.make_node(());
+        augmented_node.insert(node, augmented_id);
+        original_node.insert(augmented_id, node);
+    }
+    augmented.make_edge(super_entry, augmented_node[&root], ());
+    let component_set: HashSet<_> = component.iter().copied().collect();
+    let mut has_real_out = HashMap::<NodeId, bool>::default();
+    for &node in component {
+        has_real_out.insert(node, false);
+    }
+    let mut original_edge = HashMap::default();
+    let mut edge_ids: Vec<_> = graph.edges().map(|edge| edge.id()).collect();
+    edge_ids.sort();
+    for edge_id in edge_ids {
+        let edge = graph.get_edge(edge_id).unwrap();
+        let from = edge.from_id();
+        let to = edge.to_id();
+        if !component_set.contains(&from) || !component_set.contains(&to) {
+            continue;
+        }
+        let augmented_id = augmented.make_edge(augmented_node[&from], augmented_node[&to], ());
+        original_edge.insert(augmented_id, edge_id);
+        if from != to {
+            has_real_out.insert(from, true);
+        }
+    }
+    let exits: Vec<_> = component
+        .iter()
+        .copied()
+        .filter(|node| !has_real_out[node])
+        .collect();
+    if exits.is_empty() {
+        augmented.make_edge(augmented_node[component.last().unwrap()], super_exit, ());
+    } else {
+        for node in exits {
+            augmented.make_edge(augmented_node[&node], super_exit, ());
+        }
+    }
+
+    compute_sese_candidates(&augmented, super_entry)
+        .into_iter()
+        .filter_map(|candidate| {
+            Some((
+                candidate
+                    .contained_nodes
+                    .into_iter()
+                    .map(|node| original_node.get(&node).copied())
+                    .collect::<Option<Vec<_>>>()?,
+                original_edge.get(&candidate.entry_edge).copied()?,
+                original_edge.get(&candidate.exit_edge).copied()?,
+            ))
+        })
+        .collect()
+}
+
 /// Compute SESE regions on a CFG normalized into one explicit hammock: an
 /// analysis-only source enters the selected root and all natural exits enter
 /// an analysis-only sink.  The synthetic boundaries establish the outer
@@ -602,13 +675,12 @@ where
     SeseTree { regions }
 }
 
-/// Finds maximal node-hammocks when edge-based SESE has no useful region.
-/// A hammock may have several boundary edges, provided they all leave for the
-/// same external exit node.
-fn compute_hammock_fallback<NodeId, EdgeId, NodeData, EdgeData>(
+/// Candidate node hammocks. A hammock may have several boundary edges,
+/// provided they all leave for the same external exit node.
+fn compute_hammock_candidates<NodeId, EdgeId, NodeData, EdgeData>(
     graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
     component: &[NodeId],
-) -> SeseTree<NodeId, EdgeId>
+) -> Vec<(Vec<NodeId>, EdgeId, EdgeId)>
 where
     NodeId: Identifier + Debug + Ord,
     EdgeId: Identifier + Debug + Ord,
@@ -677,6 +749,20 @@ where
         }
     }
     candidates.sort_by_key(|(nodes, entry, exit)| (std::cmp::Reverse(nodes.len()), *entry, *exit));
+    candidates
+}
+
+/// Finds maximal node-hammocks when edge-based SESE has no useful region.
+#[cfg(test)]
+fn compute_hammock_fallback<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    component: &[NodeId],
+) -> SeseTree<NodeId, EdgeId>
+where
+    NodeId: Identifier + Debug + Ord,
+    EdgeId: Identifier + Debug + Ord,
+{
+    let candidates = compute_hammock_candidates(graph, component);
     let mut regions = vec![SeseRegion {
         parent: None,
         children: Vec::new(),
@@ -717,6 +803,120 @@ where
     SeseTree { regions }
 }
 
+/// Layout's mixed region tree retains maximal node hammocks and useful raw
+/// edge-SESE regions nested inside them. This deliberately does not alter the
+/// public canonical `compute_sese` selection rule.
+fn compute_layout_sese_tree<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    component: &[NodeId],
+    root: NodeId,
+) -> SeseTree<NodeId, EdgeId>
+where
+    NodeId: Identifier + Debug + Ord,
+    EdgeId: Identifier + Debug + Ord,
+{
+    let mut hammocks = Vec::new();
+    for candidate in compute_hammock_candidates(graph, component) {
+        if hammocks
+            .iter()
+            .any(|(nodes, _, _): &(Vec<NodeId>, EdgeId, EdgeId)| {
+                nodes.iter().any(|node| candidate.0.contains(node))
+            })
+        {
+            continue;
+        }
+        hammocks.push(candidate);
+    }
+    // Without a hammock, the established canonical hierarchy is the best
+    // structural representation and preserves previous SESE behaviour.
+    if hammocks.is_empty() {
+        return compute_sese_normalized(graph, component, root);
+    }
+
+    let mut selected = Vec::new();
+    for candidate in compute_sese_candidates_normalized(graph, component, root) {
+        if candidate.0.len() <= 1
+            || !hammocks.iter().any(|(nodes, _, _)| {
+                candidate.0.len() < nodes.len()
+                    && candidate.0.iter().all(|node| nodes.contains(node))
+            })
+        {
+            continue;
+        }
+        let laminar = selected
+            .iter()
+            .all(|(other, _, _): &(Vec<NodeId>, EdgeId, EdgeId)| {
+                let intersects = candidate.0.iter().any(|node| other.contains(node));
+                !intersects
+                    || candidate.0.iter().all(|node| other.contains(node))
+                    || other.iter().all(|node| candidate.0.contains(node))
+            });
+        if laminar
+            && !selected
+                .iter()
+                .any(|(nodes, _, _): &(Vec<NodeId>, EdgeId, EdgeId)| *nodes == candidate.0)
+        {
+            selected.push(candidate);
+        }
+    }
+    selected.sort_by_key(|(nodes, entry, exit)| (std::cmp::Reverse(nodes.len()), *entry, *exit));
+
+    let mut regions = vec![SeseRegion {
+        parent: None,
+        children: Vec::new(),
+        entry_edge: None,
+        exit_edge: None,
+        nodes: Vec::new(),
+        contained_nodes: component.to_vec(),
+    }];
+    for (nodes, entry_edge, exit_edge) in hammocks {
+        let id = regions.len();
+        regions.push(SeseRegion {
+            parent: Some(0),
+            children: Vec::new(),
+            entry_edge: Some(entry_edge),
+            exit_edge: Some(exit_edge),
+            nodes: Vec::new(),
+            contained_nodes: nodes,
+        });
+        regions[0].children.push(id);
+    }
+    for (nodes, entry_edge, exit_edge) in selected {
+        let parent = regions
+            .iter()
+            .enumerate()
+            .filter(|(_, region)| {
+                nodes
+                    .iter()
+                    .all(|node| region.contained_nodes.contains(node))
+            })
+            .min_by_key(|(_, region)| region.contained_nodes.len())
+            .map(|(id, _)| id)
+            .unwrap_or(0);
+        let id = regions.len();
+        regions.push(SeseRegion {
+            parent: Some(parent),
+            children: Vec::new(),
+            entry_edge: Some(entry_edge),
+            exit_edge: Some(exit_edge),
+            nodes: Vec::new(),
+            contained_nodes: nodes,
+        });
+        regions[parent].children.push(id);
+    }
+    for &node in component {
+        let owner = regions
+            .iter()
+            .enumerate()
+            .filter(|(_, region)| region.contained_nodes.contains(&node))
+            .min_by_key(|(_, region)| region.contained_nodes.len())
+            .map(|(id, _)| id)
+            .unwrap_or(0);
+        regions[owner].nodes.push(node);
+    }
+    SeseTree { regions }
+}
+
 fn layout_component_sese<NodeId, EdgeId, NodeData, EdgeData>(
     graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
     component: &[NodeId],
@@ -732,15 +932,7 @@ where
     let root = preferred_root
         .filter(|root| component_set.contains(root))
         .unwrap_or_else(|| *component.iter().min().unwrap());
-    let mut tree = compute_sese_normalized(graph, component, root);
-    if !tree
-        .regions
-        .iter()
-        .skip(1)
-        .any(|region| region.contained_nodes.len() > 1)
-    {
-        tree = compute_hammock_fallback(graph, component);
-    }
+    let tree = compute_layout_sese_tree(graph, component, root);
     let useful_region = tree
         .regions
         .iter()
@@ -1205,25 +1397,45 @@ where
         }
     }
 
-    // Debug bounds describe real child content plus one deliberate margin.
-    // Interface terminals are zero-area routing machinery and must not make a
-    // region rectangle taller or wider. The separate interface extent below is
-    // still retained for the proxy geometry used by the parent layout.
+    // Proxy geometry is real content plus precisely one intentional margin.
+    // Terminal ranks are routing-only: expose their paths through zero-area
+    // perimeter ports rather than allowing them to enlarge this rectangle.
     let (content_min_x, content_max_x, content_min_y, content_max_y) = node_bounds(&nodes);
-    let (mut min_x, mut max_x, mut min_y, mut max_y) =
-        (content_min_x, content_max_x, content_min_y, content_max_y);
-    for point in entry_interface
-        .iter()
-        .flatten()
-        .chain(exit_interfaces.values().flatten())
-    {
-        min_x = min_x.min(point.x);
-        max_x = max_x.max(point.x);
-        min_y = min_y.min(point.y);
-        max_y = max_y.max(point.y);
+    let width = content_max_x - content_min_x + settings.node_gap;
+    let height = content_max_y - content_min_y + settings.layer_gap;
+    let center_x = (content_min_x + content_max_x) / 2.0;
+    let center_y = (content_min_y + content_max_y) / 2.0;
+    let top = center_y - height / 2.0;
+    let bottom = center_y + height / 2.0;
+    if let Some(points) = &mut entry_interface {
+        // Replace the temporary terminal's top/bottom faces with the real
+        // proxy attachment; retaining them would make an out-and-back detour.
+        let terminal_x = points[0].x;
+        let port_x = terminal_x.clamp(center_x - width / 2.0, center_x + width / 2.0);
+        points.drain(..2);
+        points.insert(0, Point { x: port_x, y: top });
     }
-    let center_x = (min_x + max_x) / 2.0;
-    let center_y = (min_y + max_y) / 2.0;
+    let mut exit_sources: Vec<_> = exit_interfaces.keys().copied().collect();
+    exit_sources.sort();
+    let exit_count = exit_sources.len();
+    let mut used_exit_x = Vec::new();
+    for source in exit_sources {
+        let points = exit_interfaces.get_mut(&source).unwrap();
+        // The final two points are the temporary terminal's top/bottom faces.
+        let terminal_x = points[points.len() - 2].x;
+        let mut port_x = terminal_x.clamp(center_x - width / 2.0, center_x + width / 2.0);
+        if used_exit_x.iter().any(|x: &f64| (*x - port_x).abs() < 1e-6) {
+            let step = width / (exit_count + 1) as f64;
+            port_x = (center_x - width / 2.0 + step * (used_exit_x.len() + 1) as f64)
+                .clamp(center_x - width / 2.0, center_x + width / 2.0);
+        }
+        used_exit_x.push(port_x);
+        points.truncate(points.len() - 2);
+        points.push(Point {
+            x: port_x,
+            y: bottom,
+        });
+    }
     for node in nodes.values_mut() {
         node.x -= center_x;
         node.y -= center_y;
@@ -1251,8 +1463,6 @@ where
     for points in exit_interfaces.values_mut() {
         translate_points_in_place(points, -center_x, -center_y);
     }
-    let width = max_x - min_x;
-    let height = max_y - min_y;
     let mut ports = BTreeMap::new();
     if let Some(route) = &entry_interface {
         let point = route[0];
@@ -2520,7 +2730,13 @@ mod tests {
         graph.make_edge(e, f, ());
         graph.make_edge(f, end, ());
         let component = vec![root, a, end, b, c, d, e, f];
-        let tree = compute_hammock_fallback(&graph, &component);
+        let fallback = compute_hammock_fallback(&graph, &component);
+        let tree = compute_layout_sese_tree(&graph, &component, root);
+        assert_eq!(
+            tree.regions.len(),
+            4,
+            "root, hammock, and two edge-SESE children"
+        );
         let hammock = tree
             .regions
             .iter()
@@ -2528,6 +2744,25 @@ mod tests {
             .expect("b..f hammock");
         assert_eq!(hammock.entry_edge, Some(entry));
         assert_eq!(hammock.exit_edge, Some(first_exit));
+        let hammock_id = tree
+            .regions
+            .iter()
+            .position(|region| region.contained_nodes == vec![b, c, d, e, f])
+            .unwrap();
+        for nodes in [[c, d], [e, f]] {
+            let child = tree
+                .regions
+                .iter()
+                .find(|region| region.contained_nodes == nodes)
+                .expect("nested edge-SESE");
+            assert_eq!(child.parent, Some(hammock_id));
+        }
+        assert!(
+            fallback
+                .regions
+                .iter()
+                .any(|region| region.contained_nodes == vec![b, c, d, e, f])
+        );
 
         // The two exits are distinct named bottom-face ports. Their internal
         // routes terminate exactly there, and composing the root records that
@@ -2536,11 +2771,6 @@ mod tests {
             .nodes()
             .map(|node| (node.id(), NodeGeometry::default()))
             .collect();
-        let hammock_id = tree
-            .regions
-            .iter()
-            .position(|region| region.contained_nodes == vec![b, c, d, e, f])
-            .unwrap();
         let hammock_composition = compose_sese_region(
             &graph,
             &geometry,
@@ -2549,7 +2779,21 @@ mod tests {
             hammock_id,
             root,
         );
-        assert!(hammock_composition.valid);
+        assert!(hammock_composition.valid, "all proxy joins are point equal");
+        // Region bounds are content plus one margin; terminal rank spacing is
+        // not allowed to inflate a proxy rectangle.
+        for region_box in &hammock_composition.region_boxes {
+            let owned = &tree.regions[region_box.id].contained_nodes;
+            let owned_nodes: HashMap<_, _> = hammock_composition
+                .nodes
+                .iter()
+                .filter(|(id, _)| owned.contains(id))
+                .map(|(&id, &node)| (id, node))
+                .collect();
+            let (min_x, max_x, min_y, max_y) = node_bounds(&owned_nodes);
+            assert!((region_box.max_x - region_box.min_x - (max_x - min_x + 40.0)).abs() < 1e-6);
+            assert!((region_box.max_y - region_box.min_y - (max_y - min_y + 50.0)).abs() < 1e-6);
+        }
         let first_port = hammock_composition.interface.ports[&RegionPortId::Exit { source: d }];
         let second_port = hammock_composition.interface.ports[&RegionPortId::Exit { source: f }];
         assert_ne!(first_port.x_offset, second_port.x_offset);

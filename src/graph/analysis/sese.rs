@@ -57,6 +57,138 @@ struct IEdge<E> {
     original: Option<E>,
 }
 
+/// A valid edge-SESE candidate before canonical boundary selection.
+///
+/// This is intentionally crate-private: public [`compute_sese`] retains its
+/// canonical smallest-boundary semantics, while layout can retain useful
+/// non-canonical regions below a node hammock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SeseCandidate<NodeId, EdgeId> {
+    pub entry_edge: EdgeId,
+    pub exit_edge: EdgeId,
+    pub contained_nodes: Vec<NodeId>,
+}
+
+/// Enumerates every non-empty valid edge-SESE candidate.  This is the same
+/// dominance, post-dominance, JPP-cycle-class, and `region_nodes` test used by
+/// [`compute_sese`], before its canonical smallest-boundary filter.
+pub(crate) fn compute_sese_candidates<G>(
+    graph: &G,
+    root: G::NodeId,
+) -> Vec<SeseCandidate<G::NodeId, G::EdgeId>>
+where
+    G: Graph,
+    G::NodeId: Ord,
+    G::EdgeId: Ord,
+{
+    let mut ids = Vec::new();
+    let mut seen: HashSet<G::NodeId> = HashSet::default();
+    let mut queue = VecDeque::from([root]);
+    while let Some(id) = queue.pop_front() {
+        if !seen.insert(id) {
+            continue;
+        }
+        ids.push(id);
+        let mut succ: Vec<_> = graph
+            .get_node(id)
+            .into_iter()
+            .flat_map(|node| node.children().map(|edge| edge.node_id()))
+            .collect();
+        succ.sort();
+        queue.extend(succ);
+    }
+    ids.sort();
+
+    let index: HashMap<_, _> = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let synthetic_exit = ids.len();
+    let mut edges = Vec::new();
+    let mut original_edges: Vec<_> = graph
+        .edges()
+        .filter_map(|edge| {
+            let from = edge.from_id();
+            let to = edge.to_id();
+            (from != to && index.contains_key(&from) && index.contains_key(&to)).then_some((
+                edge.id(),
+                from,
+                to,
+            ))
+        })
+        .collect();
+    original_edges.sort_by_key(|(id, _, _)| *id);
+    for (id, from, to) in original_edges {
+        edges.push(IEdge {
+            from: index[&from],
+            to: index[&to],
+            original: Some(id),
+        });
+    }
+    let original_count = edges.len();
+    let mut has_out = vec![false; ids.len()];
+    for edge in &edges {
+        has_out[edge.from] = true;
+    }
+    let mut added_exit = false;
+    for (node, outgoing) in has_out.into_iter().enumerate() {
+        if !outgoing {
+            edges.push(IEdge {
+                from: node,
+                to: synthetic_exit,
+                original: None,
+            });
+            added_exit = true;
+        }
+    }
+    if !added_exit && !ids.is_empty() {
+        edges.push(IEdge {
+            from: ids.len() - 1,
+            to: synthetic_exit,
+            original: None,
+        });
+        added_exit = true;
+    }
+    if added_exit {
+        edges.push(IEdge {
+            from: synthetic_exit,
+            to: index[&root],
+            original: None,
+        });
+    }
+
+    let n = ids.len() + 1;
+    let entry = index[&root];
+    let cycle_classes = jpp_cycle_classes(&edges, n, entry);
+    let mut candidates = Vec::new();
+    for a in 0..original_count {
+        for b in 0..original_count {
+            if a == b || !edge_dominates(&edges, n, entry, a, b) {
+                continue;
+            }
+            if !edge_postdominates(&edges, n, synthetic_exit, b, a)
+                || cycle_classes[a] == 0
+                || cycle_classes[a] != cycle_classes[b]
+            {
+                continue;
+            }
+            let contained = region_nodes(&edges, n, a, b);
+            if !contained.is_empty() {
+                candidates.push(SeseCandidate {
+                    entry_edge: edges[a].original.unwrap(),
+                    exit_edge: edges[b].original.unwrap(),
+                    contained_nodes: contained.into_iter().map(|node| ids[node]).collect(),
+                });
+            }
+        }
+    }
+    candidates.sort_by_key(|candidate| {
+        (
+            std::cmp::Reverse(candidate.contained_nodes.len()),
+            candidate.entry_edge,
+            candidate.exit_edge,
+        )
+    });
+    candidates
+}
+
 /// Identifies canonical SESE regions in the directed subgraph reachable from
 /// `root`. Multiple exits are joined to an internal synthetic exit. Self-loops
 /// do not form region boundaries.
