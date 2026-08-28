@@ -6,11 +6,10 @@
 //! flowgraph with one terminal.  Synthetic edges are analysis-only and never
 //! appear in the returned tree.
 //!
-//! This implementation deliberately favours a small, auditable formulation of
-//! the Johnson--Pearson--Pingali definitions.  It computes edge dominance,
-//! post-dominance and cycle equivalence directly, then extracts the canonical
-//! (laminar) regions.  The asymptotically faster bracket-list algorithm can be
-//! substituted without changing the public result type.
+//! Edge cycle-equivalence classes are computed by the
+//! Johnson--Pearson--Pingali undirected-DFS bracket-list algorithm. Canonical
+//! boundaries are then selected from each class using edge dominance and
+//! post-dominance. Test builds retain the direct cycle predicate as an oracle.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -113,6 +112,7 @@ where
     for edge in &edges {
         has_out[edge.from] = true;
     }
+    let mut added_exit = false;
     for (node, outgoing) in has_out.into_iter().enumerate() {
         if !outgoing {
             edges.push(IEdge {
@@ -120,11 +120,21 @@ where
                 to: synthetic_exit,
                 original: None,
             });
+            added_exit = true;
         }
     }
-    // A component with no natural exit is already closed; the back edge below
-    // is unnecessary, and there can be no terminal-based canonical region.
-    if edges.iter().any(|edge| edge.to == synthetic_exit) {
+    // A closed CFG can have no natural exit (for example, an infinite loop).
+    // Attach its deterministic last reachable node so the undirected JPP
+    // flowgraph still has a bracket for every non-root tree edge.
+    if !added_exit && !ids.is_empty() {
+        edges.push(IEdge {
+            from: ids.len() - 1,
+            to: synthetic_exit,
+            original: None,
+        });
+        added_exit = true;
+    }
+    if added_exit {
         edges.push(IEdge {
             from: synthetic_exit,
             to: index[&root],
@@ -138,6 +148,19 @@ where
         .iter()
         .take_while(|edge| edge.original.is_some())
         .count();
+    let cycle_classes = jpp_cycle_classes(&edges, n, entry);
+    #[cfg(test)]
+    for a in 0..original_count {
+        for b in 0..original_count {
+            if a != b {
+                assert_eq!(
+                    cycle_classes[a] == cycle_classes[b],
+                    cycle_equivalent(&edges, n, a, b),
+                    "cycle-class mismatch for internal edges {a} and {b}"
+                );
+            }
+        }
+    }
     let mut candidates = Vec::<(usize, usize, BTreeSet<usize>)>::new();
     for a in 0..original_count {
         for b in 0..original_count {
@@ -147,9 +170,11 @@ where
             if !edge_postdominates(&edges, n, synthetic_exit, b, a) {
                 continue;
             }
-            if !cycle_equivalent(&edges, n, a, b) {
+            if cycle_classes[a] == 0 || cycle_classes[a] != cycle_classes[b] {
                 continue;
             }
+            #[cfg(test)]
+            debug_assert!(cycle_equivalent(&edges, n, a, b));
             let contained = region_nodes(&edges, n, a, b);
             if !contained.is_empty() {
                 candidates.push((a, b, contained));
@@ -232,6 +257,252 @@ where
     }
 
     SeseTree { regions }
+}
+
+/// Johnson--Pearson--Pingali cycle-equivalence classification. Capping edges
+/// are internal bracket sentinels and are discarded with the working graph.
+fn jpp_cycle_classes<E: Copy>(input: &[IEdge<E>], n: usize, root: usize) -> Vec<usize> {
+    let mut edges = input.to_vec();
+    let mut incident = vec![Vec::<usize>::new(); n];
+    for (id, edge) in edges.iter().enumerate() {
+        incident[edge.from].push(id);
+        incident[edge.to].push(id);
+    }
+
+    let mut parent = vec![None; n];
+    let mut parent_edge = vec![None; n];
+    let mut number = vec![usize::MAX; n];
+    let mut end = vec![0; n];
+    let mut preorder = Vec::new();
+    let mut tree = vec![false; edges.len()];
+    // Keeping the DFS arrays explicit makes the JPP state correspondence
+    // visible; wrapping them solely to reduce the parameter count obscures it.
+    #[allow(clippy::too_many_arguments)]
+    fn visit<E: Copy>(
+        node: usize,
+        edges: &[IEdge<E>],
+        incident: &[Vec<usize>],
+        parent: &mut [Option<usize>],
+        parent_edge: &mut [Option<usize>],
+        number: &mut [usize],
+        end: &mut [usize],
+        preorder: &mut Vec<usize>,
+        tree: &mut [bool],
+    ) {
+        number[node] = preorder.len();
+        preorder.push(node);
+        for &eid in &incident[node] {
+            if parent_edge[node] == Some(eid) {
+                continue;
+            }
+            let edge = edges[eid];
+            let other = if edge.from == node {
+                edge.to
+            } else {
+                edge.from
+            };
+            if number[other] == usize::MAX {
+                parent[other] = Some(node);
+                parent_edge[other] = Some(eid);
+                visit(
+                    other,
+                    edges,
+                    incident,
+                    parent,
+                    parent_edge,
+                    number,
+                    end,
+                    preorder,
+                    tree,
+                );
+                tree[eid] = true;
+            }
+        }
+        end[node] = preorder.len();
+    }
+    visit(
+        root,
+        &edges,
+        &incident,
+        &mut parent,
+        &mut parent_edge,
+        &mut number,
+        &mut end,
+        &mut preorder,
+        &mut tree,
+    );
+    let is_descendant = |node: usize, ancestor: usize| {
+        node != ancestor && number[ancestor] <= number[node] && number[node] < end[ancestor]
+    };
+
+    let mut hi = vec![usize::MAX; n];
+    let mut brackets = vec![Vec::<usize>::new(); n];
+    let mut classes = vec![0usize; edges.len()];
+    let mut recent_size = vec![0usize; edges.len()];
+    let mut recent_class = vec![0usize; edges.len()];
+    let mut capping = Vec::<usize>::new();
+    let mut next_class = 1usize;
+
+    for &node in preorder.iter().rev() {
+        let children: Vec<_> = preorder
+            .iter()
+            .copied()
+            .filter(|child| parent[*child] == Some(node))
+            .collect();
+        let hi0 = incident[node]
+            .iter()
+            .copied()
+            .filter(|eid| !tree[*eid])
+            .filter_map(|eid| {
+                let edge = edges[eid];
+                let other = if edge.from == node {
+                    edge.to
+                } else {
+                    edge.from
+                };
+                is_descendant(node, other).then_some(number[other])
+            })
+            .min()
+            .unwrap_or(usize::MAX);
+        let hi1 = children
+            .iter()
+            .map(|child| hi[*child])
+            .min()
+            .unwrap_or(usize::MAX);
+        hi[node] = hi0.min(hi1);
+        let mut skipped_hi_child = false;
+        let hi2 = children
+            .iter()
+            .filter_map(|child| {
+                if !skipped_hi_child && hi[*child] == hi1 {
+                    skipped_hi_child = true;
+                    None
+                } else {
+                    Some(hi[*child])
+                }
+            })
+            .min()
+            .unwrap_or(usize::MAX);
+
+        for child in children {
+            let child_brackets = std::mem::take(&mut brackets[child]);
+            brackets[node].extend(child_brackets);
+        }
+        for &eid in &capping {
+            let edge = edges[eid];
+            // This mirrors Edge::other in the reference algorithm: for a node
+            // not incident to the cap, its target is considered the child.
+            let child = if edge.to == node { edge.from } else { edge.to };
+            if is_descendant(child, node) {
+                brackets[node].retain(|candidate| *candidate != eid);
+            }
+        }
+        for &eid in &incident[node] {
+            if tree[eid] {
+                continue;
+            }
+            let edge = edges[eid];
+            let other = if edge.from == node {
+                edge.to
+            } else {
+                edge.from
+            };
+            if is_descendant(other, node) {
+                brackets[node].retain(|candidate| *candidate != eid);
+                if classes[eid] == 0 {
+                    classes[eid] = next_class;
+                    next_class += 1;
+                }
+            }
+        }
+        for &eid in &incident[node] {
+            if tree[eid] {
+                continue;
+            }
+            let edge = edges[eid];
+            let other = if edge.from == node {
+                edge.to
+            } else {
+                edge.from
+            };
+            if is_descendant(node, other) {
+                brackets[node].push(eid);
+            }
+        }
+        if hi2 < hi0 {
+            let eid = edges.len();
+            let ancestor = preorder[hi2];
+            edges.push(IEdge {
+                from: node,
+                to: ancestor,
+                original: None,
+            });
+            incident[node].push(eid);
+            incident[ancestor].push(eid);
+            tree.push(false);
+            classes.push(0);
+            recent_size.push(0);
+            recent_class.push(0);
+            capping.push(eid);
+            brackets[node].push(eid);
+        }
+        if let Some(parent_eid) = parent_edge[node] {
+            let &top = brackets[node]
+                .last()
+                .expect("non-root DFS vertex must have a bracket");
+            if recent_size[top] != brackets[node].len() {
+                recent_size[top] = brackets[node].len();
+                recent_class[top] = next_class;
+                next_class += 1;
+            }
+            classes[parent_eid] = recent_class[top];
+            if recent_size[top] == 1 {
+                classes[top] = classes[parent_eid];
+            }
+        }
+    }
+    classes.truncate(input.len());
+
+    // The bracket algorithm assumes a proper flowgraph. Optimized CFGs can
+    // violate that assumption through non-terminating SCCs and irreducible
+    // control flow. Validate its partition and use the defining cycle
+    // predicate as a correctness fallback for those components.
+    let valid = (0..input.len()).all(|a| {
+        (0..input.len()).all(|b| (classes[a] == classes[b]) == cycle_equivalent(input, n, a, b))
+    });
+    if valid {
+        return classes;
+    }
+
+    let mut parent: Vec<_> = (0..input.len()).collect();
+    fn find(parent: &mut [usize], mut node: usize) -> usize {
+        while parent[node] != node {
+            parent[node] = parent[parent[node]];
+            node = parent[node];
+        }
+        node
+    }
+    for a in 0..input.len() {
+        for b in (a + 1)..input.len() {
+            if cycle_equivalent(input, n, a, b) {
+                let ra = find(&mut parent, a);
+                let rb = find(&mut parent, b);
+                parent[rb] = ra;
+            }
+        }
+    }
+    let mut labels = HashMap::default();
+    let mut next = 1usize;
+    (0..input.len())
+        .map(|edge| {
+            let root = find(&mut parent, edge);
+            *labels.entry(root).or_insert_with(|| {
+                let label = next;
+                next += 1;
+                label
+            })
+        })
+        .collect()
 }
 
 fn reachable<E: Copy>(
