@@ -576,6 +576,121 @@ where
     SeseTree { regions }
 }
 
+/// Finds maximal node-hammocks when edge-based SESE has no useful region.
+/// A hammock may have several boundary edges, provided they all leave for the
+/// same external exit node.
+fn compute_hammock_fallback<NodeId, EdgeId, NodeData, EdgeData>(
+    graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
+    component: &[NodeId],
+) -> SeseTree<NodeId, EdgeId>
+where
+    NodeId: Identifier + Debug + Ord,
+    EdgeId: Identifier + Debug + Ord,
+{
+    let component_set: HashSet<_> = component.iter().copied().collect();
+    let mut edges: Vec<_> = graph
+        .edges()
+        .filter_map(|edge| {
+            (component_set.contains(&edge.from_id()) && component_set.contains(&edge.to_id()))
+                .then_some((edge.id(), edge.from_id(), edge.to_id()))
+        })
+        .collect();
+    edges.sort_by_key(|(id, _, _)| *id);
+    let mut candidates = Vec::<(Vec<NodeId>, EdgeId, EdgeId)>::new();
+    for &entry in component {
+        for &exit in component {
+            if entry == exit {
+                continue;
+            }
+            let mut forward = HashSet::default();
+            let mut stack = vec![entry];
+            while let Some(node) = stack.pop() {
+                if node == exit || !forward.insert(node) {
+                    continue;
+                }
+                stack.extend(
+                    edges
+                        .iter()
+                        .filter_map(|(_, from, to)| (*from == node).then_some(*to)),
+                );
+            }
+            let mut reverse = HashSet::default();
+            let mut stack = vec![exit];
+            while let Some(node) = stack.pop() {
+                if !reverse.insert(node) {
+                    continue;
+                }
+                stack.extend(
+                    edges
+                        .iter()
+                        .filter_map(|(_, from, to)| (*to == node).then_some(*from)),
+                );
+            }
+            let contained: HashSet<_> = forward.intersection(&reverse).copied().collect();
+            if contained.len() <= 1 || !contained.contains(&entry) {
+                continue;
+            }
+            let incoming: Vec<_> = edges
+                .iter()
+                .filter(|(_, from, to)| !contained.contains(from) && contained.contains(to))
+                .collect();
+            let outgoing: Vec<_> = edges
+                .iter()
+                .filter(|(_, from, to)| contained.contains(from) && !contained.contains(to))
+                .collect();
+            if incoming.is_empty()
+                || outgoing.is_empty()
+                || incoming.iter().any(|(_, _, to)| *to != entry)
+                || outgoing.iter().any(|(_, _, to)| *to != exit)
+            {
+                continue;
+            }
+            let mut nodes: Vec<_> = contained.into_iter().collect();
+            nodes.sort();
+            candidates.push((nodes, incoming[0].0, outgoing[0].0));
+        }
+    }
+    candidates.sort_by_key(|(nodes, entry, exit)| (std::cmp::Reverse(nodes.len()), *entry, *exit));
+    let mut regions = vec![SeseRegion {
+        parent: None,
+        children: Vec::new(),
+        entry_edge: None,
+        exit_edge: None,
+        nodes: Vec::new(),
+        contained_nodes: component.to_vec(),
+    }];
+    for (nodes, entry, exit) in candidates {
+        if regions.iter().skip(1).any(|region| {
+            region
+                .contained_nodes
+                .iter()
+                .any(|node| nodes.contains(node))
+        }) {
+            continue;
+        }
+        let id = regions.len();
+        regions.push(SeseRegion {
+            parent: Some(0),
+            children: Vec::new(),
+            entry_edge: Some(entry),
+            exit_edge: Some(exit),
+            nodes: Vec::new(),
+            contained_nodes: nodes,
+        });
+        regions[0].children.push(id);
+    }
+    for &node in component {
+        let owner = regions
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(id, region)| region.contained_nodes.contains(&node).then_some(id))
+            .unwrap_or(0);
+        regions[owner].nodes.push(node);
+    }
+    SeseTree { regions }
+}
+
 fn layout_component_sese<NodeId, EdgeId, NodeData, EdgeData>(
     graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
     component: &[NodeId],
@@ -591,7 +706,15 @@ where
     let root = preferred_root
         .filter(|root| component_set.contains(root))
         .unwrap_or_else(|| *component.iter().min().unwrap());
-    let tree = compute_sese_normalized(graph, component, root);
+    let mut tree = compute_sese_normalized(graph, component, root);
+    if !tree
+        .regions
+        .iter()
+        .skip(1)
+        .any(|region| region.contained_nodes.len() > 1)
+    {
+        tree = compute_hammock_fallback(graph, component);
+    }
     let useful_region = tree
         .regions
         .iter()
@@ -608,6 +731,8 @@ where
     // falling back for that component instead.
     if !routes_clear_of_nodes(&composition.nodes, &composition.edges)
         || !routes_are_deconflicted(&composition.edges)
+        || (settings.edge_style == EdgeStyle::Orthogonal
+            && !routes_are_orthogonal(&composition.edges))
     {
         return layout_component(graph, component, geometry, preferred_root, settings);
     }
@@ -678,7 +803,9 @@ struct RegionComposition<NodeId: Identifier, EdgeId: Identifier> {
     /// Synthetic boundary-interface paths. They are spliced into the parent
     /// quotient edge when this region is expanded, but never exposed as edges.
     entry_interface: Option<Vec<Point>>,
-    exit_interface: Option<Vec<Point>>,
+    /// One terminal path for every original node with an edge leaving the
+    /// region. Node hammocks may have several exit edges to one exit node.
+    exit_interfaces: HashMap<NodeId, Vec<Point>>,
     region_boxes: Vec<RegionBox>,
     width: f64,
     height: f64,
@@ -738,11 +865,22 @@ where
 
     let contained: HashSet<_> = region.contained_nodes.iter().copied().collect();
     let mut original_for_quotient = HashMap::default();
-    // A non-root region has explicit, invisible entry/exit terminals. Their
-    // ordinary flat-layout routes provide the internal half of a proxy port.
-    let interface = if let (Some(entry), Some(exit)) = (region.entry_edge, region.exit_edge) {
+    // A non-root region has an entry terminal and one exit terminal for every
+    // boundary source. Canonical edge SESE has one; a node hammock can have
+    // several edges leaving distinct nodes for the same external exit node.
+    let exit_sources: Vec<_> = graph
+        .edges()
+        .filter_map(|edge| {
+            (contained.contains(&edge.from_id())
+                && !contained.contains(&edge.to_id())
+                && edge.from_id() != edge.to_id())
+            .then_some(edge.from_id())
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let interface = region.entry_edge.map(|entry| {
         let entry_terminal = quotient.make_node(());
-        let exit_terminal = quotient.make_node(());
         quotient_geometry.insert(
             entry_terminal,
             NodeGeometry {
@@ -750,21 +888,23 @@ where
                 height: 1.0,
             },
         );
-        quotient_geometry.insert(
-            exit_terminal,
-            NodeGeometry {
-                width: 1.0,
-                height: 1.0,
-            },
-        );
         let entry_target = graph.get_edge(entry).unwrap().to_id();
-        let exit_source = graph.get_edge(exit).unwrap().from_id();
         let entry_link = quotient.make_edge(entry_terminal, entity_for_node[&entry_target], ());
-        let exit_link = quotient.make_edge(entity_for_node[&exit_source], exit_terminal, ());
-        Some((entry_terminal, exit_terminal, entry_link, exit_link))
-    } else {
-        None
-    };
+        let mut exits = Vec::new();
+        for source in &exit_sources {
+            let terminal = quotient.make_node(());
+            quotient_geometry.insert(
+                terminal,
+                NodeGeometry {
+                    width: 1.0,
+                    height: 1.0,
+                },
+            );
+            let link = quotient.make_edge(entity_for_node[source], terminal, ());
+            exits.push((*source, terminal, link));
+        }
+        (entry_terminal, entry_link, exits)
+    });
     let mut edge_ids: Vec<_> = graph.edges().map(|edge| edge.id()).collect();
     edge_ids.sort();
     for edge_id in edge_ids {
@@ -802,10 +942,9 @@ where
         &flat_settings,
     );
 
-    let (mut entry_interface, mut exit_interface) =
-        if let Some((entry, exit, entry_link, exit_link)) = interface {
+    let (mut entry_interface, mut exit_interfaces) =
+        if let Some((entry, entry_link, exits)) = interface {
             let entry_node = quotient_layout.nodes[&entry];
-            let exit_node = quotient_layout.nodes[&exit];
             let mut entry_points = vec![
                 Point {
                     x: entry_node.x,
@@ -817,14 +956,19 @@ where
                 },
             ];
             entry_points.extend(quotient_layout.edges[&entry_link].iter().copied().skip(1));
-            let mut exit_points = quotient_layout.edges[&exit_link].clone();
-            exit_points.push(Point {
-                x: exit_node.x,
-                y: exit_node.y + exit_node.height / 2.0,
-            });
-            (Some(entry_points), Some(exit_points))
+            let mut paths = HashMap::default();
+            for (source, terminal, link) in exits {
+                let terminal_node = quotient_layout.nodes[&terminal];
+                let mut points = quotient_layout.edges[&link].clone();
+                points.push(Point {
+                    x: terminal_node.x,
+                    y: terminal_node.y + terminal_node.height / 2.0,
+                });
+                paths.insert(source, points);
+            }
+            (Some(entry_points), paths)
         } else {
-            (None, None)
+            (None, HashMap::default())
         };
 
     let mut nodes = HashMap::default();
@@ -862,11 +1006,16 @@ where
             region_box.max_y += proxy.y;
             region_boxes.push(region_box);
         }
+        let child_exits: HashMap<NodeId, Vec<Point>> = child
+            .exit_interfaces
+            .drain()
+            .map(|(source, points)| (source, translate_points(points, proxy.x, proxy.y)))
+            .collect();
         child_interfaces.insert(
             proxy_entity[&child_id],
             (
                 translate_points(child.entry_interface.take().unwrap(), proxy.x, proxy.y),
-                translate_points(child.exit_interface.take().unwrap(), proxy.x, proxy.y),
+                child_exits,
             ),
         );
     }
@@ -884,15 +1033,14 @@ where
             points.extend(nested_entry.iter().copied().skip(1));
         }
     }
-    if let Some(exit) = region.exit_edge {
-        let source = graph.get_edge(exit).unwrap().from_id();
+    for (&source, points) in &mut exit_interfaces {
         let entity = entity_for_node[&source];
         if child_for_proxy.contains_key(&entity) {
-            let (_, nested_exit) = &child_interfaces[&entity];
-            let mut points = nested_exit.clone();
-            splice_points(&mut points, exit_interface.as_ref().unwrap()[0]);
-            points.extend(exit_interface.take().unwrap().into_iter().skip(1));
-            exit_interface = Some(points);
+            let (_, nested_exits) = &child_interfaces[&entity];
+            let mut expanded = nested_exits[&source].clone();
+            splice_points(&mut expanded, points[0]);
+            expanded.extend(points.iter().copied().skip(1));
+            *points = expanded;
         }
     }
 
@@ -908,8 +1056,8 @@ where
         let from = edge.from_id();
         let to = edge.to_id();
         if child_for_proxy.contains_key(&entity_for_node[&from]) {
-            let (_, exit) = &child_interfaces[&entity_for_node[&from]];
-            let mut expanded = exit.clone();
+            let (_, exits) = &child_interfaces[&entity_for_node[&from]];
+            let mut expanded = exits[&from].clone();
             splice_points(&mut expanded, points[0]);
             expanded.extend(points.into_iter().skip(1));
             points = expanded;
@@ -982,14 +1130,14 @@ where
     if let Some(points) = &mut entry_interface {
         translate_points_in_place(points, -center_x, -center_y);
     }
-    if let Some(points) = &mut exit_interface {
+    for points in exit_interfaces.values_mut() {
         translate_points_in_place(points, -center_x, -center_y);
     }
     RegionComposition {
         nodes,
         edges,
         entry_interface,
-        exit_interface,
+        exit_interfaces,
         region_boxes,
         width: max_x - min_x,
         height: max_y - min_y,
@@ -1050,6 +1198,14 @@ fn routes_clear_of_nodes<NodeId: Identifier, EdgeId: Identifier>(
                     node.height,
                 )
             })
+        })
+    })
+}
+
+fn routes_are_orthogonal<EdgeId: Identifier>(edges: &HashMap<EdgeId, Vec<Point>>) -> bool {
+    edges.values().all(|points| {
+        points.windows(2).all(|segment| {
+            (segment[0].x - segment[1].x).abs() < 1e-6 || (segment[0].y - segment[1].y).abs() < 1e-6
         })
     })
 }
@@ -2168,6 +2324,50 @@ mod tests {
                 .iter()
                 .all(|node| [entry, left, right].contains(node))
         }));
+    }
+
+    #[test]
+    fn hammock_fallback_groups_multiple_exit_edges_to_one_exit_node() {
+        let mut graph = G::default();
+        let root = graph.make_node(());
+        let a = graph.make_node(());
+        let end = graph.make_node(());
+        let b = graph.make_node(());
+        let c = graph.make_node(());
+        let d = graph.make_node(());
+        let e = graph.make_node(());
+        let f = graph.make_node(());
+        graph.make_edge(root, a, ());
+        graph.make_edge(a, end, ());
+        let entry = graph.make_edge(root, b, ());
+        graph.make_edge(b, c, ());
+        graph.make_edge(c, d, ());
+        let first_exit = graph.make_edge(d, end, ());
+        graph.make_edge(b, e, ());
+        graph.make_edge(e, f, ());
+        graph.make_edge(f, end, ());
+        let component = vec![root, a, end, b, c, d, e, f];
+        let tree = compute_hammock_fallback(&graph, &component);
+        let hammock = tree
+            .regions
+            .iter()
+            .find(|region| region.contained_nodes == vec![b, c, d, e, f])
+            .expect("b..f hammock");
+        assert_eq!(hammock.entry_edge, Some(entry));
+        assert_eq!(hammock.exit_edge, Some(first_exit));
+
+        let layout = LayoutBuilder::new(&graph)
+            .root(root)
+            .mode(LayoutMode::Sese)
+            .build()
+            .unwrap();
+        assert!(layout.regions.len() >= 2, "root and hammock debug bounds");
+        let mut endpoints = HashMap::default();
+        for edge in graph.edges() {
+            endpoints.insert(edge.id(), (edge.from_id(), edge.to_id()));
+        }
+        assert_route_attaches_to_endpoints(&layout, &endpoints);
+        assert_no_edge_through_nonincident_node(&layout, &endpoints);
     }
 
     #[test]
