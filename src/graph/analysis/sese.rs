@@ -301,6 +301,7 @@ fn region_nodes<E: Copy>(
 #[cfg(test)]
 mod tests {
     use jstd_derive::Identifier;
+    use proptest::prelude::*;
 
     use super::*;
     use crate::graph::owning::OwningGraph;
@@ -362,6 +363,94 @@ mod tests {
                 .iter()
                 .any(|region| region.entry_edge == Some(shared))
         );
+    }
+
+    #[test]
+    fn multiple_exits_use_an_internal_terminal_without_exposing_it() {
+        let mut graph = G::default();
+        let root = graph.make_node(());
+        let left = graph.make_node(());
+        let right = graph.make_node(());
+        graph.make_edge(root, left, ());
+        graph.make_edge(root, right, ());
+
+        let tree = compute_sese(&graph, root);
+        let mut owned: Vec<_> = tree
+            .regions
+            .iter()
+            .flat_map(|region| region.nodes.iter().copied())
+            .collect();
+        owned.sort();
+        assert_eq!(owned, vec![root, left, right]);
+        assert!(tree.regions.iter().all(|region| {
+            region.entry_edge.is_some() == region.exit_edge.is_some() || region.parent.is_none()
+        }));
+    }
+
+    #[test]
+    fn loop_body_is_a_canonical_region() {
+        let mut graph = G::default();
+        let s = graph.make_node(());
+        let header = graph.make_node(());
+        let body = graph.make_node(());
+        let after = graph.make_node(());
+        let t = graph.make_node(());
+        let entry = graph.make_edge(s, header, ());
+        graph.make_edge(header, body, ());
+        graph.make_edge(body, header, ());
+        let exit = graph.make_edge(header, after, ());
+        graph.make_edge(after, t, ());
+
+        let tree = compute_sese(&graph, s);
+        assert!(tree.regions.iter().any(|region| {
+            region.entry_edge == Some(entry)
+                && region.exit_edge == Some(exit)
+                && region.contained_nodes.contains(&header)
+                && region.contained_nodes.contains(&body)
+        }));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn generated_program_structure_trees_are_laminar_and_total(
+            node_count in 2usize..=10,
+            extra_edges in proptest::collection::vec((0usize..16, 0usize..16), 0..24),
+        ) {
+            let mut graph = G::default();
+            let nodes: Vec<_> = (0..node_count).map(|_| graph.make_node(())).collect();
+            // A backbone makes every generated node reachable while the extra
+            // edges supply branches, loops, and irreducible cross-links.
+            for pair in nodes.windows(2) {
+                graph.make_edge(pair[0], pair[1], ());
+            }
+            for (from, to) in extra_edges {
+                graph.make_edge(nodes[from % node_count], nodes[to % node_count], ());
+            }
+
+            let tree = compute_sese(&graph, nodes[0]);
+            let mut owned: Vec<_> = tree.regions.iter()
+                .flat_map(|region| region.nodes.iter().copied())
+                .collect();
+            owned.sort();
+            prop_assert_eq!(&owned, &nodes);
+            for (id, region) in tree.regions.iter().enumerate() {
+                for &child in &region.children {
+                    prop_assert_eq!(tree.regions[child].parent, Some(id));
+                    prop_assert!(tree.regions[child].contained_nodes.iter()
+                        .all(|node| region.contained_nodes.contains(node)));
+                }
+            }
+            for (i, lhs) in tree.regions.iter().enumerate().skip(1) {
+                for rhs in tree.regions.iter().skip(i + 1) {
+                    let intersects = lhs.contained_nodes.iter()
+                        .any(|node| rhs.contained_nodes.contains(node));
+                    prop_assert!(!intersects
+                        || lhs.contained_nodes.iter().all(|node| rhs.contained_nodes.contains(node))
+                        || rhs.contained_nodes.iter().all(|node| lhs.contained_nodes.contains(node)));
+                }
+            }
+        }
     }
 
     #[test]
