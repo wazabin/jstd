@@ -1103,7 +1103,20 @@ where
         }
     }
 
-    let (min_x, max_x, min_y, max_y) = node_bounds(&nodes);
+    // Interface terminals are part of a proxy's physical contract. Include
+    // their complete routed stubs in its bounds so the parent proxy face and
+    // debug rectangle enclose the actual entry/exit attachment geometry.
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = node_bounds(&nodes);
+    for point in entry_interface
+        .iter()
+        .flatten()
+        .chain(exit_interfaces.values().flatten())
+    {
+        min_x = min_x.min(point.x);
+        max_x = max_x.max(point.x);
+        min_y = min_y.min(point.y);
+        max_y = max_y.max(point.y);
+    }
     let center_x = (min_x + max_x) / 2.0;
     let center_y = (min_y + max_y) / 2.0;
     for node in nodes.values_mut() {
