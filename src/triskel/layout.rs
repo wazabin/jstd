@@ -1917,6 +1917,22 @@ mod tests {
                 (pair[0].x - pair[1].x).abs() < 1e-6 || (pair[0].y - pair[1].y).abs() < 1e-6
             }));
         }
+
+        let straight = LayoutBuilder::new(&graph)
+            .root(nodes[0])
+            .mode(LayoutMode::Sese)
+            .edge_style(EdgeStyle::Straight)
+            .build()
+            .unwrap();
+        assert!(
+            straight
+                .edges
+                .values()
+                .any(|points| points.windows(2).any(|pair| {
+                    (pair[0].x - pair[1].x).abs() > 1e-6 && (pair[0].y - pair[1].y).abs() > 1e-6
+                }))
+        );
+        assert_no_edge_through_nonincident_node(&straight, &endpoints);
     }
 
     #[test]
