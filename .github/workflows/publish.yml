@@ -1,0 +1,50 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches workspace version
+        run: |
+          version="$(
+            cargo metadata --no-deps --format-version 1 |
+              python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; versions = {package["version"] for package in packages if package["name"] in {"wazabin-jstd", "wazabin-jstd-derive"}}; assert len(versions) == 1, f"package versions differ: {versions}"; print(versions.pop())'
+          )"
+
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$tag_version" = "$version" || {
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          }
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Publish wazabin-jstd-derive
+        run: |
+          if cargo publish -p wazabin-jstd-derive; then
+            exit 0
+          fi
+
+      - name: Publish wazabin-jstd after registry indexing
+        run: |
+          for attempt in {1..20}; do
+            if cargo publish -p wazabin-jstd; then
+              exit 0
+            fi
+
+            echo "wazabin-jstd-derive is not indexed yet; retrying in 15 seconds..."
+            sleep 15
+          done
+          exit 1
