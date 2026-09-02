@@ -3,6 +3,8 @@
 Small, reusable Rust utilities: typed identifiers, registries, graphs, string
 interning, and stable arenas.
 
+Developed by [Thalium](https://blog.thalium.re/about/).
+
 ## Layout PNG tool
 
 `triskel-png` reads a basic directed DOT graph and renders Triskel's layout to
