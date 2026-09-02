@@ -24,7 +24,9 @@ use crate::{
     },
     registry::Identifier,
     triskel::{
-        coordinate, cycle, order, rank,
+        coordinate, cycle,
+        hammock::compute_hammocks,
+        order, rank,
         render::{render_html, render_html_with_labels, render_svg, render_svg_with_labels},
         router::{EdgeRouter, EdgeStyle, OrthogonalRouter, StraightRouter},
         segment,
@@ -677,6 +679,7 @@ where
 
 /// Candidate node hammocks. A hammock may have several boundary edges,
 /// provided they all leave for the same external exit node.
+#[cfg(test)]
 fn compute_hammock_candidates<NodeId, EdgeId, NodeData, EdgeData>(
     graph: &OwningGraph<NodeId, EdgeId, NodeData, EdgeData>,
     component: &[NodeId],
@@ -815,18 +818,10 @@ where
     NodeId: Identifier + Debug + Ord,
     EdgeId: Identifier + Debug + Ord,
 {
-    let mut hammocks = Vec::new();
-    for candidate in compute_hammock_candidates(graph, component) {
-        if hammocks
-            .iter()
-            .any(|(nodes, _, _): &(Vec<NodeId>, EdgeId, EdgeId)| {
-                nodes.iter().any(|node| candidate.0.contains(node))
-            })
-        {
-            continue;
-        }
-        hammocks.push(candidate);
-    }
+    let hammocks: Vec<_> = compute_hammocks(graph, component, root)
+        .into_iter()
+        .map(|hammock| (hammock.nodes, hammock.entry_edge, hammock.exit_edge))
+        .collect();
     // Without a hammock, the established canonical hierarchy is the best
     // structural representation and preserves previous SESE behaviour.
     if hammocks.is_empty() {

@@ -1,0 +1,11 @@
+digraph hammoc {
+    root -> a
+    a -> end
+    root -> b
+    b -> c
+    c -> d
+    d -> end
+    b -> e
+    e -> f
+    f -> end
+}

@@ -25,6 +25,7 @@ pub mod coordinate;
 pub mod cycle;
 pub mod energy;
 pub(crate) mod geometry;
+pub(crate) mod hammock;
 pub mod layout;
 pub mod order;
 pub mod rank;
