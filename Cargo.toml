@@ -3,7 +3,7 @@ members = ["derive"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -36,7 +36,7 @@ image.workspace = true
 # Fast non-cryptographic hasher for internal int-keyed maps; deterministic
 # iteration order (std RandomState reseeds per process).
 rustc-hash.workspace = true
-jstd_derive = { package = "wazabin-jstd-derive", version = "0.1.0", path = "derive" }
+jstd_derive = { package = "wazabin-jstd-derive", version = "0.1.1", path = "derive" }
 serde.workspace = true
 
 [dev-dependencies]
