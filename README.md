@@ -1,5 +1,8 @@
 # wazabin-jstd
 
+[![CI](https://github.com/wazabin/jstd/actions/workflows/ci.yml/badge.svg)](https://github.com/wazabin/jstd/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/wazabin-jstd.svg)](https://crates.io/crates/wazabin-jstd)
+
 Small, reusable Rust utilities: typed identifiers, registries, graphs, string
 interning, and stable arenas.
 
