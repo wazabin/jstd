@@ -16,7 +16,7 @@ bincode = { version = "2", features = ["serde"] }
 criterion = "0.5"
 
 [package]
-name = "jstd"
+name = "wazabin-jstd"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -24,12 +24,15 @@ license.workspace = true
 description = "Typed identifiers, graphs, registries, and string interning"
 readme = "README.md"
 
+[lib]
+name = "jstd"
+
 [dependencies]
 image.workspace = true
 # Fast non-cryptographic hasher for internal int-keyed maps; deterministic
 # iteration order (std RandomState reseeds per process).
 rustc-hash.workspace = true
-jstd_derive = { version = "0.1.0", path = "derive" }
+jstd_derive = { package = "wazabin-jstd-derive", version = "0.1.0", path = "derive" }
 serde.workspace = true
 
 [dev-dependencies]

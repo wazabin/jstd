@@ -1,10 +1,10 @@
 [package]
-name = "jstd_derive"
+name = "wazabin-jstd-derive"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Derive macros for jstd (Identifier, etc.)"
+description = "Derive macros for wazabin-jstd (Identifier, etc.)"
 readme = "README.md"
 
 [lib]
