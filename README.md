@@ -1,4 +1,4 @@
-# jstd
+# wazabin-jstd
 
 Small, reusable Rust utilities: typed identifiers, registries, graphs, string
 interning, and stable arenas.
