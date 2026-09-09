@@ -63,7 +63,7 @@ struct IEdge<E> {
 /// canonical smallest-boundary semantics, while layout can retain useful
 /// non-canonical regions below a node hammock.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SeseCandidate<NodeId, EdgeId> {
+pub struct SeseCandidate<NodeId, EdgeId> {
     pub entry_edge: EdgeId,
     pub exit_edge: EdgeId,
     pub contained_nodes: Vec<NodeId>,
@@ -72,7 +72,7 @@ pub(crate) struct SeseCandidate<NodeId, EdgeId> {
 /// Enumerates every non-empty valid edge-SESE candidate.  This is the same
 /// dominance, post-dominance, JPP-cycle-class, and `region_nodes` test used by
 /// [`compute_sese`], before its canonical smallest-boundary filter.
-pub(crate) fn compute_sese_candidates<G>(
+pub fn compute_sese_candidates<G>(
     graph: &G,
     root: G::NodeId,
 ) -> Vec<SeseCandidate<G::NodeId, G::EdgeId>>

@@ -3,25 +3,28 @@
 [![CI](https://github.com/wazabin/jstd/actions/workflows/ci.yml/badge.svg)](https://github.com/wazabin/jstd/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/wazabin-jstd.svg)](https://crates.io/crates/wazabin-jstd)
 
-Small, reusable Rust utilities: typed identifiers, registries, graphs, string
-interning, and stable arenas.
+Small, reusable Rust building blocks, extracted from a binary-analysis
+toolchain and kept dependency-light.
 
 Developed by [Thalium](https://blog.thalium.re/about/).
 
-## Layout PNG tool
+## What's here
 
-`triskel-png` reads a basic directed DOT graph and renders Triskel's layout to
-PNG. It accepts DOT wrappers, node attributes, and edge chains; DOT styling and
-labels are intentionally ignored.
+- **`registry`** — strongly typed `usize` identifiers (`#[derive(Identifier)]`)
+  and id-indexed registries, so a `NodeId` can never be passed where an
+  `EdgeId` belongs.
+- **`graph`** — directed graph containers (borrowing and owning), plus
+  `graph::analysis`: dominator and post-dominator trees, and canonical
+  edge-based SESE (single-entry/single-exit) region decomposition.
+- **`stable_arena`** — an arena whose elements keep their address as it grows.
+- **`intern`** — string interning.
+- **`num_ref`** — small numeric reference helpers.
 
-```sh
-cargo run --bin triskel-png -- input.dot output.png --sese --debug
-```
+## Graph layout
 
-Options: `--sese` enables SESE composition, `--debug` draws the SESE proxy
-bounds used by the layout, `--straight` requests straight routing, and
-`--scale N` controls raster scale (default `2`). In debug mode, an empty region
-set means SESE fell back to flat layout for that component.
+Triskel, the layered ("Sugiyama-style") graph layout engine, now lives in its
+own crate: [`wazabin-triskel`](https://crates.io/crates/wazabin-triskel). It
+builds on this crate's `graph` module.
 
 ## Development
 

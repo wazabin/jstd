@@ -44,7 +44,7 @@ pub fn reachable_from_root<C: Cfg>(graph: &C, root: C::NodeId) -> Vec<C::NodeId>
 /// access and then cached.
 ///
 /// The tree is generic over the hasher `S` used for its internal, node-keyed
-/// maps — pinned to the source graph's [`Graph::Hasher`] by
+/// maps — pinned to the source graph's [`Graph::Hasher`](crate::graph::Graph::Hasher) by
 /// [`compute_dominators`] — rather than hardcoding a concrete one. It defaults
 /// to [`FxBuildHasher`] so the common `DominatorTree<NodeId>` spelling keeps
 /// the fast, deterministic hasher that graph consumers (e.g. qcode's `Context`)
