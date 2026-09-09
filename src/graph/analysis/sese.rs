@@ -748,6 +748,98 @@ mod tests {
     }
 
     #[test]
+    fn candidates_include_non_canonical_regions_largest_first() {
+        // s -> a -> {b, c} -> d -> t with an extra straight edge d -> e -> t.
+        // The candidate list keeps the enclosing non-canonical (a..e) region
+        // that compute_sese collapses, ordered largest first.
+        let mut graph = G::default();
+        let s = graph.make_node(());
+        let a = graph.make_node(());
+        let b = graph.make_node(());
+        let c = graph.make_node(());
+        let d = graph.make_node(());
+        let e = graph.make_node(());
+        let t = graph.make_node(());
+        let entry = graph.make_edge(s, a, ());
+        graph.make_edge(a, b, ());
+        graph.make_edge(a, c, ());
+        graph.make_edge(b, d, ());
+        graph.make_edge(c, d, ());
+        let middle = graph.make_edge(d, e, ());
+        let exit = graph.make_edge(e, t, ());
+        // A self-loop must never become a boundary or a candidate.
+        graph.make_edge(e, e, ());
+
+        let candidates = compute_sese_candidates(&graph, s);
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates
+                .windows(2)
+                .all(|pair| pair[0].contained_nodes.len() >= pair[1].contained_nodes.len())
+        );
+        assert!(candidates.contains(&SeseCandidate {
+            entry_edge: entry,
+            exit_edge: exit,
+            contained_nodes: vec![a, b, c, d, e],
+        }));
+        assert!(candidates.contains(&SeseCandidate {
+            entry_edge: entry,
+            exit_edge: middle,
+            contained_nodes: vec![a, b, c, d],
+        }));
+        assert!(candidates.contains(&SeseCandidate {
+            entry_edge: middle,
+            exit_edge: exit,
+            contained_nodes: vec![e],
+        }));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.entry_edge != candidate.exit_edge)
+        );
+
+        // Unreachable nodes are ignored entirely.
+        let orphan = graph.make_node(());
+        graph.make_edge(orphan, s, ());
+        assert_eq!(compute_sese_candidates(&graph, s), candidates);
+    }
+
+    #[test]
+    fn tree_accessors_and_cyclic_graphs_without_sinks() {
+        // Every node has a successor, so the synthetic exit hangs off the
+        // last node instead of a natural sink.
+        let mut graph = G::default();
+        let a = graph.make_node(());
+        let b = graph.make_node(());
+        let c = graph.make_node(());
+        graph.make_edge(a, b, ());
+        graph.make_edge(b, c, ());
+        graph.make_edge(c, a, ());
+
+        let tree = compute_sese(&graph, a);
+        assert!(tree.root().parent.is_none());
+        assert_eq!(tree.root().entry_edge, None);
+        assert_eq!(tree.root().exit_edge, None);
+        assert_eq!(tree.root().contained_nodes, vec![a, b, c]);
+        // The chain a -> b -> c still yields the single-node region {b}.
+        assert!(tree.has_nontrivial_regions());
+        assert!(tree.regions[1..].iter().all(|region| {
+            region.parent.is_some() && region.entry_edge.is_some() && region.exit_edge.is_some()
+        }));
+        assert!(
+            compute_sese_candidates(&graph, a)
+                .iter()
+                .any(|candidate| candidate.contained_nodes == vec![b])
+        );
+
+        let mut single = G::default();
+        let only = single.make_node(());
+        let tree = compute_sese(&single, only);
+        assert_eq!(tree.root().nodes, vec![only]);
+        assert!(!tree.has_nontrivial_regions());
+    }
+
+    #[test]
     fn sequential_regions_may_share_a_boundary_edge() {
         let mut graph = G::default();
         let n: Vec<_> = (0..10).map(|_| graph.make_node(())).collect();
