@@ -206,6 +206,21 @@ impl<Id: Identifier, T> Registry<Id, T> {
         self.len
     }
 
+    /// Drops every element with an id of `len` or above, keeping the chunks
+    /// already allocated so the next pushes reuse them.
+    ///
+    /// The ids below `len` and their elements' addresses are unchanged. This
+    /// is the one way a registry shrinks: for a construction that appended
+    /// elements it then has to take back, and for a scratch store that starts
+    /// its ids over.
+    pub fn truncate(&mut self, len: usize) {
+        while self.len > len {
+            let (k, offset) = locate(self.len - 1);
+            self.chunks[k].truncate(offset);
+            self.len -= 1;
+        }
+    }
+
     /// Returns `true` if the registry contains no elements.
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -514,6 +529,28 @@ mod tests {
     struct Id(usize);
 
     /// Segment math places element `n` in chunk `floor(log2(n+1))`.
+    #[test]
+    fn truncate_keeps_earlier_ids_and_chunk_capacity() {
+        let mut registry: Registry<Id, u32> = (0..7).collect();
+        let capacity: Vec<usize> = registry.chunks.iter().map(Vec::capacity).collect();
+
+        registry.truncate(2);
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry[Id(1)], 1);
+        assert_eq!(registry.chunks[0].capacity(), capacity[0]);
+        assert_eq!(registry.chunks[1].capacity(), capacity[1]);
+        assert!(registry.chunks[2].is_empty());
+
+        assert_eq!(registry.push(9), Id(2));
+        assert_eq!(registry.push(10), Id(3));
+        assert_eq!(registry.chunks[2].capacity(), capacity[2]);
+
+        registry.truncate(0);
+        assert!(registry.is_empty());
+        registry.truncate(5);
+        assert!(registry.is_empty());
+    }
+
     #[test]
     fn locate_matches_doubling_layout() {
         assert_eq!(locate(0), (0, 0)); // chunk 0 (size 1)

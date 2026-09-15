@@ -142,6 +142,36 @@ impl<Id: Identifier, T> StableArena<Id, T> {
         removed
     }
 
+    /// Drops every payload and starts issuing ids from zero again, keeping
+    /// the capacity already allocated.
+    ///
+    /// Every id issued before is invalid afterwards, and *will be issued
+    /// again*: this begins a new epoch of the arena, and a stale id from the
+    /// previous one silently names a different payload. Only an owner that
+    /// can vouch no such id survives may call this.
+    pub fn clear(&mut self) {
+        self.values.clear();
+        self.slot_ids.clear();
+        self.locations.clear();
+    }
+
+    /// Removes every payload whose id is `issued` or above and stops counting
+    /// those ids as issued, so the next push reuses the first of them.
+    ///
+    /// The payloads are removed newest first, so an arena that only ever
+    /// pushed since the ids below `issued` were issued keeps its dense order.
+    /// Like [`clear`](Self::clear), this reissues ids: it is for taking back
+    /// a batch of pushes whose ids never escaped.
+    pub fn truncate_issued(&mut self, issued: usize) {
+        for raw in (issued..self.locations.len()).rev() {
+            let id = Id::from(raw);
+            if self.contains(id) {
+                self.remove(id);
+            }
+        }
+        self.locations.truncate(issued);
+    }
+
     /// Iterates over live entries in dense physical order.
     pub fn iter(&self) -> Iter<'_, Id, T> {
         Iter {
@@ -403,6 +433,43 @@ mod tests {
 
     #[derive(Identifier)]
     struct Id(u32);
+
+    #[test]
+    fn clear_starts_a_new_epoch_with_the_old_capacity() {
+        let mut arena = StableArena::<Id, &str>::default();
+        let a = arena.push("a");
+        arena.push("b");
+        arena.remove(a);
+        let capacity = arena.capacity();
+
+        arena.clear();
+        assert!(arena.is_empty());
+        assert_eq!(arena.issued_len(), 0);
+        assert_eq!(arena.capacity(), capacity);
+        assert_eq!(arena.push("c"), a, "ids are issued again");
+        assert_eq!(arena[a], "c");
+    }
+
+    #[test]
+    fn truncate_issued_takes_back_the_newest_ids() {
+        let mut arena = StableArena::<Id, &str>::default();
+        let a = arena.push("a");
+        let b = arena.push("b");
+        let issued = arena.issued_len();
+        let c = arena.push("c");
+        let d = arena.push("d");
+        arena.remove(c);
+
+        arena.truncate_issued(issued);
+        assert_eq!(arena.issued_len(), issued);
+        assert!(!arena.contains(d));
+        assert_eq!(
+            arena.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            [a, b],
+            "the surviving entries keep their order"
+        );
+        assert_eq!(arena.push("e"), c, "the taken-back ids are reissued");
+    }
 
     #[test]
     fn removal_repairs_moved_slot_and_never_reuses_ids() {
