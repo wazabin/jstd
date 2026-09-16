@@ -192,8 +192,10 @@ impl<Id: Identifier, T> Registry<Id, T> {
     pub fn push(&mut self, e: T) -> Id {
         let n = self.len;
         let (k, offset) = locate(n);
-        if offset == 0 {
-            // First element of a fresh chunk `k`; earlier chunks are already full.
+        if offset == 0 && self.chunks.len() == k {
+            // First element of a fresh chunk `k`; earlier chunks are already
+            // full. A chunk `truncate` emptied is still there, at its old
+            // capacity, and is reused rather than shadowed by a new one.
             self.chunks.push(Vec::with_capacity(1 << k));
         }
         self.chunks[k].push(e);
@@ -549,6 +551,32 @@ mod tests {
         assert!(registry.is_empty());
         registry.truncate(5);
         assert!(registry.is_empty());
+    }
+
+    /// Pushing after a truncate refills the chunks that are already there; it
+    /// does not append a fresh chunk every time the registry starts over,
+    /// which would retain one more set of capacities per epoch.
+    #[test]
+    fn pushing_after_truncate_reuses_the_emptied_chunks() {
+        let mut registry: Registry<Id, u32> = (0..7).collect();
+        let chunks = registry.chunks.len();
+        let capacity: Vec<usize> = registry.chunks.iter().map(Vec::capacity).collect();
+        for epoch in 0..100 {
+            registry.truncate(0);
+            for i in 0..7 {
+                assert_eq!(registry.push(i + epoch), Id(i as usize));
+            }
+            assert_eq!(registry.chunks.len(), chunks, "epoch {epoch}");
+            let now: Vec<usize> = registry.chunks.iter().map(Vec::capacity).collect();
+            assert_eq!(now, capacity, "epoch {epoch}");
+            assert_eq!(registry[Id(6)], 6 + epoch);
+        }
+        // Growing past the old length still appends the next chunk.
+        for i in 7..15 {
+            registry.push(i);
+        }
+        assert_eq!(registry.chunks.len(), chunks + 1);
+        assert_eq!(registry[Id(14)], 14);
     }
 
     #[test]
