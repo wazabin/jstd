@@ -4,6 +4,7 @@
 //! - [`registry`] — strongly typed `usize` identifiers ([`Identifier`]) and
 //!   id-indexed registries, so a `NodeId` cannot be passed where an `EdgeId`
 //!   belongs.
+//! - [`recycling_arena`] — typed slab storage that reuses removed slots.
 //! - [`graph`] — directed graph containers, plus [`graph::analysis`] for
 //!   dominator and post-dominator trees and canonical edge-based SESE
 //!   (single-entry/single-exit) region decomposition.
@@ -42,5 +43,6 @@ pub mod graph;
 pub mod intern;
 pub mod log;
 pub mod num_ref;
+pub mod recycling_arena;
 pub mod registry;
 pub mod stable_arena;
